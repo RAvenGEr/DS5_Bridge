@@ -1,0 +1,627 @@
+import { Button, VerticalBox, HorizontalBox, LineEdit, Switch, ScrollView } from "std-widgets.slint";
+
+export struct GameRuleData {
+    id: string,
+    process_name: string,
+    mode: string, // "dualsense", "dualsense-edge", "ds4", "xbox"
+}
+
+// A persona quick-switch card. `active` highlights it, `accent` is the mode
+// colour used for the border/accent text.
+component ModeCard inherits Rectangle {
+    in property <string> kicker: "";
+    in property <string> title: "";
+    in property <string> subtitle: "";
+    in property <bool> active: false;
+    in property <color> accent: #6366f1;
+    in property <color> active_bg: #242b45;
+    callback activated;
+
+    height: 78px;
+    horizontal-stretch: 1;
+    background: root.active ? root.active_bg : #1a1c23;
+    border-color: root.active ? root.accent : #2a2d39;
+    border-width: root.active ? 2px : 1px;
+    border-radius: 10px;
+
+    touch := TouchArea {
+        clicked => { root.activated(); }
+
+        VerticalBox {
+            padding: 10px;
+            spacing: 3px;
+            alignment: center;
+
+            Text {
+                text: root.kicker;
+                font-size: 10px;
+                color: #8a8d9b;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: root.title;
+                font-size: 14px;
+                font-weight: 800;
+                color: root.active ? #ffffff : #c0c4d0;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: root.subtitle;
+                font-size: 10px;
+                color: root.active ? root.accent : #525866;
+                horizontal-alignment: center;
+            }
+        }
+    }
+}
+
+// Red "danger" action button; the std Button has no colour styling.
+component DangerButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    height: 36px;
+    background: !root.enabled ? #1a1c23 : (touch.pressed ? #7f1d1d : #3b161b);
+    border-color: root.enabled ? #f87171 : #2a2d39;
+    border-width: 1px;
+    border-radius: 8px;
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+
+    Text {
+        text: root.text;
+        color: root.enabled ? #fecaca : #6b7280;
+        font-size: 12px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        width: root.width;
+        height: root.height;
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "DS5 Bridge Companion";
+    preferred-width: 580px;
+    preferred-height: 900px;
+    min-width: 540px;
+    min-height: 800px;
+    background: #121318;
+    icon: @image-url("assets/icon.png");
+
+    in-out property <bool> is_connected: false;
+    in-out property <string> connection_status_text: "Searching for DS5 Bridge...";
+    in-out property <bool> controller_connected: false;
+    in-out property <string> controller_name: "DualSense";
+    in-out property <int> battery_percent: -1; // -1 means unknown/discharging
+    in-out property <string> active_persona: "dualsense"; // "dualsense", "ds4", "xbox", "dualsense-edge"
+    in-out property <string> firmware_version: "1.7.1";
+    in-out property <string> uptime_text: "0m";
+    
+    // Auto-Switching properties
+    in-out property <bool> auto_switch_enabled: true;
+    in-out property <string> detected_game: "None";
+    in-out property <string> active_rule_status: "No active rule";
+    in-out property <[GameRuleData]> game_rules: [];
+    
+    // New rule input
+    in-out property <string> new_rule_process: "";
+    in-out property <string> new_rule_mode: "xbox";
+
+    // Power & sleep settings, mirrored from the bridge status report
+    in-out property <bool> idle_disconnect_enabled: false;
+    in-out property <string> idle_timeout_text: "15";
+    in-out property <bool> usb_suspend_disconnect_enabled: false;
+    in-out property <bool> wake_on_connect_enabled: false;
+    in-out property <bool> sleep_keybind_enabled: false;
+
+    // Result of the last command sent to the bridge
+    in-out property <string> command_status_text: "Ready";
+    in-out property <bool> command_status_ok: true;
+
+    callback set_persona(string); // "dualsense", "dualsense-edge", "ds4", "xbox"
+    callback toggle_auto_switch(bool);
+    callback add_game_rule(string, string);
+    callback remove_game_rule(string);
+    callback minimize_to_tray();
+    callback sleep_controller();
+    callback toggle_power_setting(string, bool);
+    callback set_idle_timeout(string);
+
+    VerticalBox {
+        padding: 18px;
+        spacing: 12px;
+
+        // --- Top Bar / Header ---
+        HorizontalBox {
+            spacing: 12px;
+            alignment: center;
+
+            // Brand icon / title
+            VerticalBox {
+                alignment: center;
+                spacing: 2px;
+                Text {
+                    text: "DS5 BRIDGE";
+                    font-size: 18px;
+                    font-weight: 800;
+                    color: #ffffff;
+                }
+                Text {
+                    text: "Rust Companion v0.1";
+                    font-size: 11px;
+                    color: #8a8d9b;
+                }
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            // Bridge Connection Badge
+            Rectangle {
+                background: root.is_connected ? #1b382b : #381f24;
+                border-color: root.is_connected ? #34d399 : #f87171;
+                border-width: 1px;
+                border-radius: 12px;
+                height: 32px;
+
+                HorizontalBox {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: 8px;
+                    alignment: center;
+
+                    Rectangle {
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 4px;
+                        background: root.is_connected ? #34d399 : #f87171;
+                    }
+
+                    Text {
+                        text: root.connection_status_text;
+                        color: root.is_connected ? #6ee7b7 : #fca5a5;
+                        font-size: 12px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // --- Status Card ---
+        Rectangle {
+            background: #1a1c23;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: #2a2d39;
+            height: 64px;
+
+            HorizontalBox {
+                padding: 10px;
+                spacing: 16px;
+
+                // Controller info
+                HorizontalBox {
+                    spacing: 10px;
+                    alignment: center;
+
+                    Text {
+                        text: root.controller_connected ? "🎮" : "❌";
+                        font-size: 20px;
+                    }
+
+                    VerticalBox {
+                        spacing: 2px;
+                        alignment: center;
+
+                        Text {
+                            text: root.controller_connected ? root.controller_name : "Controller Disconnected";
+                            color: #ffffff;
+                            font-size: 13px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: root.controller_connected ? "Connected via Pico Bridge" : "Waiting for wireless or USB connection";
+                            color: #8a8d9b;
+                            font-size: 11px;
+                        }
+                    }
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                // Battery Status
+                if root.controller_connected && root.battery_percent >= 0: HorizontalBox {
+                    spacing: 6px;
+                    alignment: center;
+
+                    Text {
+                        text: "🔋 " + root.battery_percent + "%";
+                        color: root.battery_percent <= 20 ? #f87171 : #6ee7b7;
+                        font-size: 13px;
+                        font-weight: 700;
+                    }
+                }
+
+                // Firmware info
+                VerticalBox {
+                    spacing: 2px;
+                    alignment: center;
+
+                    Text {
+                        text: "FW " + root.firmware_version;
+                        color: #a0a5b5;
+                        font-size: 11px;
+                    }
+                    Text {
+                        text: "Uptime: " + root.uptime_text;
+                        color: #6b7280;
+                        font-size: 10px;
+                    }
+                }
+            }
+        }
+
+        // --- Quick Mode Switcher ---
+        Text {
+            text: "QUICK MODE SWITCHER";
+            font-size: 11px;
+            font-weight: 700;
+            color: #6366f1;
+            letter-spacing: 0.5px;
+        }
+
+        HorizontalBox {
+            spacing: 12px;
+
+            // DualSense Button
+            ModeCard {
+                kicker: "PlayStation 5";
+                title: "DualSense";
+                subtitle: "Adaptive Triggers";
+                active: root.active_persona == "dualsense";
+                accent: #6366f1;
+                active_bg: #242b45;
+                activated => { root.set_persona("dualsense"); }
+            }
+
+            // DualSense Edge Button
+            ModeCard {
+                kicker: "PlayStation 5";
+                title: "Edge";
+                subtitle: "DualSense Edge";
+                active: root.active_persona == "dualsense-edge";
+                accent: #a78bfa;
+                active_bg: #2a2440;
+                activated => { root.set_persona("dualsense-edge"); }
+            }
+
+            // DualShock 4 Button
+            ModeCard {
+                kicker: "PlayStation 4";
+                title: "DualShock 4";
+                subtitle: "PS4 & Remote Play";
+                active: root.active_persona == "ds4";
+                accent: #38bdf8;
+                active_bg: #1f2d3d;
+                activated => { root.set_persona("ds4"); }
+            }
+
+            // Xbox 360 Button
+            ModeCard {
+                kicker: "Windows PC";
+                title: "Xbox 360";
+                subtitle: "Native XInput Mode";
+                active: root.active_persona == "xbox";
+                accent: #4ade80;
+                active_bg: #1b3326;
+                activated => { root.set_persona("xbox"); }
+            }
+        }
+
+        // --- Power & Sleep ---
+        HorizontalBox {
+            spacing: 10px;
+            alignment: center;
+
+            Text {
+                text: "POWER & SLEEP";
+                font-size: 11px;
+                font-weight: 700;
+                color: #6366f1;
+                letter-spacing: 0.5px;
+                vertical-alignment: center;
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            Text {
+                text: root.command_status_text;
+                color: root.command_status_ok ? #34d399 : #f87171;
+                font-size: 11px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+
+            DangerButton {
+                text: "⏻  Turn Off Controller";
+                enabled: root.controller_connected;
+                clicked => { root.sleep_controller(); }
+            }
+        }
+
+        Rectangle {
+            background: #161821;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #262938;
+
+            VerticalBox {
+                padding: 10px;
+                spacing: 8px;
+
+                GridLayout {
+                    spacing: 14px;
+
+                    Row {
+                        Switch {
+                            text: "Idle disconnect";
+                            checked: root.idle_disconnect_enabled;
+                            enabled: root.is_connected;
+                            toggled => { root.toggle_power_setting("idle_disconnect", self.checked); }
+                        }
+                        Switch {
+                            text: "USB suspend disconnect";
+                            checked: root.usb_suspend_disconnect_enabled;
+                            enabled: root.is_connected;
+                            toggled => { root.toggle_power_setting("usb_suspend_disconnect", self.checked); }
+                        }
+                    }
+
+                    Row {
+                        Switch {
+                            text: "Wake on connect";
+                            checked: root.wake_on_connect_enabled;
+                            enabled: root.is_connected;
+                            toggled => { root.toggle_power_setting("wake_on_connect", self.checked); }
+                        }
+                        Switch {
+                            text: "Sleep keybind (PS button)";
+                            checked: root.sleep_keybind_enabled;
+                            enabled: root.is_connected;
+                            toggled => { root.toggle_power_setting("sleep_keybind", self.checked); }
+                        }
+                    }
+                }
+
+                HorizontalBox {
+                    spacing: 8px;
+                    alignment: center;
+
+                    Text {
+                        text: "Disconnect the controller after";
+                        color: #94a3b8;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+
+                    LineEdit {
+                        width: 56px;
+                        enabled: root.is_connected;
+                        text <=> root.idle_timeout_text;
+                        accepted => { root.set_idle_timeout(self.text); }
+                    }
+
+                    Text {
+                        text: "minutes of inactivity";
+                        color: #64748b;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle { horizontal-stretch: 1; }
+                }
+            }
+        }
+
+        // --- Game Auto-Switching Rules Section ---
+        HorizontalBox {
+            alignment: space-between;
+
+            Text {
+                text: "GAME AUTO-SWITCHING";
+                font-size: 11px;
+                font-weight: 700;
+                color: #6366f1;
+                letter-spacing: 0.5px;
+                vertical-alignment: center;
+            }
+
+            HorizontalBox {
+                spacing: 8px;
+                alignment: center;
+
+                Text {
+                    text: root.auto_switch_enabled ? "Enabled" : "Disabled";
+                    color: root.auto_switch_enabled ? #34d399 : #9ca3af;
+                    font-size: 11px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
+
+                Switch {
+                    checked: root.auto_switch_enabled;
+                    toggled => {
+                        root.toggle_auto_switch(self.checked);
+                    }
+                }
+            }
+        }
+
+        // Game Monitor Status Bar
+        Rectangle {
+            background: #161821;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #262938;
+            height: 36px;
+
+            HorizontalBox {
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 8px;
+                alignment: center;
+
+                Text {
+                    text: "🔍 Foreground Process: ";
+                    color: #94a3b8;
+                    font-size: 11px;
+                    font-weight: 600;
+                }
+
+                Text {
+                    text: root.detected_game;
+                    color: #e2e8f0;
+                    font-size: 11px;
+                    font-weight: 700;
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                Text {
+                    text: root.active_rule_status;
+                    color: #a7f3d0;
+                    font-size: 11px;
+                    font-weight: 600;
+                }
+            }
+        }
+
+        // Add Rule Bar
+        HorizontalBox {
+            spacing: 8px;
+            height: 36px;
+
+            LineEdit {
+                horizontal-stretch: 1;
+                placeholder-text: "Process name (e.g. game.exe)";
+                text <=> root.new_rule_process;
+            }
+
+            Button {
+                text: "Xbox";
+                clicked => { root.add_game_rule(root.new_rule_process, "xbox"); root.new_rule_process = ""; }
+            }
+            Button {
+                text: "DualSense";
+                clicked => { root.add_game_rule(root.new_rule_process, "dualsense"); root.new_rule_process = ""; }
+            }
+            Button {
+                text: "Edge";
+                clicked => { root.add_game_rule(root.new_rule_process, "dualsense-edge"); root.new_rule_process = ""; }
+            }
+            Button {
+                text: "DS4";
+                clicked => { root.add_game_rule(root.new_rule_process, "ds4"); root.new_rule_process = ""; }
+            }
+        }
+
+        // Rules List
+        Rectangle {
+            vertical-stretch: 1;
+            background: #161821;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #262938;
+
+            ScrollView {
+                VerticalBox {
+                    padding: 8px;
+                    spacing: 6px;
+
+                    if root.game_rules.length == 0: Text {
+                        text: "No game rules defined. Add executable names above to trigger auto-switching when games launch.";
+                        color: #64748b;
+                        font-size: 11px;
+                        horizontal-alignment: center;
+                    }
+
+                    for rule in root.game_rules: Rectangle {
+                        background: #1e212d;
+                        border-radius: 6px;
+                        height: 36px;
+
+                        HorizontalBox {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 8px;
+                            alignment: center;
+
+                            Text {
+                                text: "🎮 " + rule.process_name;
+                                color: #f1f5f9;
+                                font-size: 12px;
+                                font-weight: 600;
+                            }
+
+                            Rectangle { horizontal-stretch: 1; }
+
+                            Rectangle {
+                                background: rule.mode == "xbox" ? #1b3326
+                                    : (rule.mode == "dualsense" ? #242b45
+                                    : (rule.mode == "dualsense-edge" ? #2a2440 : #1f2d3d));
+                                border-radius: 4px;
+                                height: 22px;
+
+                                HorizontalBox {
+                                    padding-left: 8px;
+                                    padding-right: 8px;
+                                    alignment: center;
+
+                                    Text {
+                                        text: rule.mode == "xbox" ? "XBOX MODE"
+                                            : (rule.mode == "dualsense" ? "DUALSENSE MODE"
+                                            : (rule.mode == "dualsense-edge" ? "EDGE MODE" : "DS4 MODE"));
+                                        color: rule.mode == "xbox" ? #4ade80
+                                            : (rule.mode == "dualsense" ? #818cf8
+                                            : (rule.mode == "dualsense-edge" ? #a78bfa : #38bdf8));
+                                        font-size: 10px;
+                                        font-weight: 700;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+
+                            Button {
+                                text: "✕";
+                                clicked => { root.remove_game_rule(rule.id); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Bottom Action Bar
+        HorizontalBox {
+            spacing: 10px;
+            alignment: space-between;
+
+            Button {
+                text: "Minimize to System Tray";
+                clicked => { root.minimize_to_tray(); }
+            }
+
+            Text {
+                text: "DS5 Bridge Companion (Rust)";
+                color: #475569;
+                font-size: 10px;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
