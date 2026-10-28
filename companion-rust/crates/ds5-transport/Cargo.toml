@@ -1,0 +1,21 @@
+[package]
+name = "ds5-transport"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_Security",
+] }
+
+[lints.rust]
+unsafe_code = "allow"

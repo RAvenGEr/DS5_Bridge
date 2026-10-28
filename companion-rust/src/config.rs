@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use directories::ProjectDirs;
 
-use crate::protocol::{AudioPacketMode, HostPersonaMode};
+use ds5_transport::{AudioPacketMode, HostPersonaMode};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameRule {

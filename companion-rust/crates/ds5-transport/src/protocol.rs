@@ -97,15 +97,6 @@ impl HostPersonaMode {
         mask & (1 << self.to_protocol_value()) != 0
     }
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            HostPersonaMode::DualSense => "dualsense",
-            HostPersonaMode::DualSenseEdge => "dualsense-edge",
-            HostPersonaMode::Ds4 => "ds4",
-            HostPersonaMode::Xbox => "xbox",
-        }
-    }
-
     pub fn display_name(self) -> &'static str {
         match self {
             HostPersonaMode::DualSense => "DualSense (PS5)",
@@ -144,13 +135,6 @@ impl AudioPacketMode {
         match self {
             AudioPacketMode::Double => "double",
             AudioPacketMode::Single => "single",
-        }
-    }
-
-    pub fn parse_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "single" => AudioPacketMode::Single,
-            _ => AudioPacketMode::Double,
         }
     }
 
