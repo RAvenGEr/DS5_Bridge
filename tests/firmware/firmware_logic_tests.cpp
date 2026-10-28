@@ -583,7 +583,10 @@ void output_state_audio_snapshot_routes_to_speaker_and_headphones_safely() {
     EXPECT_EQ(speaker[kSpeakerVolumeOffset], kSpeakerVolumeMax);
     EXPECT_EQ(speaker[kMicVolumeOffset], 0);
     EXPECT_EQ(speaker[kMuteLedOffset], 0);
-    EXPECT_EQ(speaker[kAudioControlOffset], kAudioFlagsOutputPathSpeaker);
+    EXPECT_EQ(
+        speaker[kAudioControlOffset],
+        static_cast<uint8_t>(kAudioFlagsOutputPathSpeaker | kAudioFlagsNoiseCancelEnable)
+    );
     EXPECT_EQ(speaker[kAudioControl2Offset], 0x02);
 
     AudioSnapshot headset{};
@@ -594,7 +597,10 @@ void output_state_audio_snapshot_routes_to_speaker_and_headphones_safely() {
     EXPECT_TRUE((headset[kValidFlag1Offset] & kFlag1AudioControl2Enable) != 0);
     EXPECT_EQ(headset[kHeadphoneVolumeOffset], kHeadphoneVolumeMax);
     EXPECT_EQ(headset[kSpeakerVolumeOffset], 0);
-    EXPECT_EQ(headset[kAudioControlOffset], kAudioFlagsOutputPathHeadphones);
+    EXPECT_EQ(
+        headset[kAudioControlOffset],
+        static_cast<uint8_t>(kAudioFlagsOutputPathHeadphones | kAudioFlagsNoiseCancelEnable)
+    );
     EXPECT_EQ(headset[kAudioControl2Offset], 0x02);
 
     controller_output_state_set_speaker_gain(6);

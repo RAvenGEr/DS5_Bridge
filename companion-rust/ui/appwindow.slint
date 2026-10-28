@@ -99,7 +99,7 @@ export component AppWindow inherits Window {
     in-out property <string> controller_name: "DualSense";
     in-out property <int> battery_percent: -1; // -1 means unknown/discharging
     in-out property <string> active_persona: "dualsense"; // "dualsense", "ds4", "xbox", "dualsense-edge"
-    in-out property <string> firmware_version: "1.7.1";
+    in-out property <string> firmware_version: "1.8.0";
     in-out property <string> uptime_text: "0m";
     
     // Auto-Switching properties
@@ -119,6 +119,10 @@ export component AppWindow inherits Window {
     in-out property <bool> wake_on_connect_enabled: false;
     in-out property <bool> sleep_keybind_enabled: false;
 
+    // Audio packet mode: "double" (0x39) or "single" (0x36)
+    in-out property <string> audio_packet_mode: "double";
+    in-out property <bool> audio_packet_mode_supported: false;
+
     // Result of the last command sent to the bridge
     in-out property <string> command_status_text: "Ready";
     in-out property <bool> command_status_ok: true;
@@ -131,6 +135,7 @@ export component AppWindow inherits Window {
     callback sleep_controller();
     callback toggle_power_setting(string, bool);
     callback set_idle_timeout(string);
+    callback set_audio_packet_mode(string);
 
     VerticalBox {
         padding: 18px;
@@ -152,7 +157,7 @@ export component AppWindow inherits Window {
                     color: #ffffff;
                 }
                 Text {
-                    text: "Rust Companion v0.1";
+                    text: "Rust Companion v0.2";
                     font-size: 11px;
                     color: #8a8d9b;
                 }
@@ -395,6 +400,28 @@ export component AppWindow inherits Window {
                             enabled: root.is_connected;
                             toggled => { root.toggle_power_setting("sleep_keybind", self.checked); }
                         }
+                    }
+
+                    Row {
+                        Button {
+                            text: "Single (0x36)";
+                            enabled: root.is_connected && root.audio_packet_mode_supported;
+                            clicked => { root.set_audio_packet_mode("single"); }
+                        }
+                        Button {
+                            text: "Double (0x39)";
+                            enabled: root.is_connected && root.audio_packet_mode_supported;
+                            clicked => { root.set_audio_packet_mode("double"); }
+                        }
+                        Text {
+                            text: root.audio_packet_mode_supported
+                                ? "Current: " + root.audio_packet_mode + " · Single uses more bandwidth"
+                                : "Requires firmware protocol 1.24 or newer";
+                            color: #64748b;
+                            font-size: 10px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
                     }
                 }
 

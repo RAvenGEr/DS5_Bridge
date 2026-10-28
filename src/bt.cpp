@@ -67,8 +67,9 @@
 #define DS_OUTPUT_VALID_FLAG2_LIGHTBAR_SETUP_CONTROL_ENABLE 0x02
 #define DS_OUTPUT_VALID_FLAG2_ENABLE_IMPROVED_RUMBLE_EMULATION 0x04
 #define DS_OUTPUT_VALID_FLAG2_USE_RUMBLE_NOT_HAPTICS2 0x08
-#define DS_OUTPUT_AUDIO_FLAGS_OUTPUT_PATH_HEADPHONES 0x00
-#define DS_OUTPUT_AUDIO_FLAGS_OUTPUT_PATH_SPEAKER 0x30
+#define DS_OUTPUT_AUDIO_FLAGS_NOISE_CANCEL_ENABLE ds5::output::kAudioFlagsNoiseCancelEnable
+#define DS_OUTPUT_AUDIO_FLAGS_OUTPUT_PATH_HEADPHONES ds5::output::kAudioFlagsOutputPathHeadphones
+#define DS_OUTPUT_AUDIO_FLAGS_OUTPUT_PATH_SPEAKER ds5::output::kAudioFlagsOutputPathSpeaker
 #define DS_OUTPUT_POWER_SAVE_CONTROL_MIC_MUTE 0x10
 #define DS_OUTPUT_HEADPHONE_VOLUME_MAX 0x7f
 #define DS_OUTPUT_SPEAKER_VOLUME_MAX 0x64
@@ -2169,16 +2170,19 @@ static void send_speaker_output_state(bool enabled, bool headset_plugged) {
         if (headset_plugged) {
             report[3] |= DS_OUTPUT_VALID_FLAG0_HEADPHONE_VOLUME_ENABLE;
             report[3 + OUTPUT_PAYLOAD_HEADPHONE_VOLUME_OFFSET] = DS_OUTPUT_HEADPHONE_VOLUME_MAX;
-            report[3 + OUTPUT_PAYLOAD_AUDIO_CONTROL_OFFSET] = DS_OUTPUT_AUDIO_FLAGS_OUTPUT_PATH_HEADPHONES;
+            report[3 + OUTPUT_PAYLOAD_AUDIO_CONTROL_OFFSET] =
+                DS_OUTPUT_AUDIO_FLAGS_OUTPUT_PATH_HEADPHONES | DS_OUTPUT_AUDIO_FLAGS_NOISE_CANCEL_ENABLE;
         } else {
             report[3] |= DS_OUTPUT_VALID_FLAG0_SPEAKER_VOLUME_ENABLE;
             report[3 + 1] = DS_OUTPUT_VALID_FLAG1_AUDIO_CONTROL2_ENABLE;
             report[3 + OUTPUT_PAYLOAD_SPEAKER_VOLUME_OFFSET] = DS_OUTPUT_SPEAKER_VOLUME_MAX;
-            report[3 + OUTPUT_PAYLOAD_AUDIO_CONTROL_OFFSET] = DS_OUTPUT_AUDIO_FLAGS_OUTPUT_PATH_SPEAKER;
+            report[3 + OUTPUT_PAYLOAD_AUDIO_CONTROL_OFFSET] =
+                DS_OUTPUT_AUDIO_FLAGS_OUTPUT_PATH_SPEAKER | DS_OUTPUT_AUDIO_FLAGS_NOISE_CANCEL_ENABLE;
             report[3 + OUTPUT_PAYLOAD_AUDIO_CONTROL2_OFFSET] = speaker_output_gain;
         }
     } else {
-        report[3 + OUTPUT_PAYLOAD_AUDIO_CONTROL_OFFSET] = DS_OUTPUT_AUDIO_FLAGS_OUTPUT_PATH_HEADPHONES;
+        report[3 + OUTPUT_PAYLOAD_AUDIO_CONTROL_OFFSET] =
+            DS_OUTPUT_AUDIO_FLAGS_OUTPUT_PATH_HEADPHONES | DS_OUTPUT_AUDIO_FLAGS_NOISE_CANCEL_ENABLE;
     }
     bt_write(report, sizeof(report));
 }
@@ -4333,6 +4337,7 @@ static bool dualsense_output_transport_report(output_packet const &packet) {
     const uint8_t report_id = packet.data[1];
     return report_id == DS_OUTPUT_REPORT_BT
         || report_id == 0x32
+        || report_id == 0x36
         || report_id == 0x39;
 }
 

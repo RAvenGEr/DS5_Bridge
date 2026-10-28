@@ -31,7 +31,7 @@ namespace {
 
 constexpr uint8_t kMagic[] = {'D', 'S', '5', 'B'};
 constexpr uint8_t kProtocolMajor = 1;
-constexpr uint8_t kProtocolMinor = 23;
+constexpr uint8_t kProtocolMinor = 24;
 constexpr uint8_t kProtocolMinSupportedMinor = 7;
 static_assert(DS5_FIRMWARE_VERSION_MAJOR <= 255);
 static_assert(DS5_FIRMWARE_VERSION_MINOR <= 255);
@@ -161,6 +161,7 @@ enum CommandId : uint8_t {
     CommandSetLightbarRestoreEnabled = 0x36,
     CommandSetRadialDeadzones = 0x37,
     CommandSetEdgeProfileSwitchingBlocked = 0x45,
+    CommandSetAudioPacketMode = 0x46,
 };
 
 enum AckResult : uint8_t {
@@ -2170,6 +2171,16 @@ void handle_command(uint8_t const *buffer, uint16_t bufsize) {
                 return;
             }
             audio_set_haptics_buffer_length(static_cast<uint8_t>(value));
+            settings_revision++;
+            set_ack(command_id, sequence, AckOk);
+            return;
+
+        case CommandSetAudioPacketMode:
+            if (value > 1) {
+                set_ack(command_id, sequence, AckInvalidValue);
+                return;
+            }
+            audio_set_packet_mode(static_cast<uint8_t>(value));
             settings_revision++;
             set_ack(command_id, sequence, AckOk);
             return;

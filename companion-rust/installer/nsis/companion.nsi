@@ -15,8 +15,8 @@
 ; Preferred build:  ..\build.ps1   (builds the release binary, then packages)
 ;
 ; Direct build (from this directory):
-;   makensis /DPRODUCT_VERSION=0.1.0 ^
-;            /DPRODUCT_VERSION_QUAD=0.1.0.0 ^
+;   makensis /DPRODUCT_VERSION=0.2.0 ^
+;            /DPRODUCT_VERSION_QUAD=0.2.0.0 ^
 ;            /DRELEASE_EXE=..\..\target\release\companion-rust.exe ^
 ;            companion.nsi
 ;
@@ -37,7 +37,7 @@ ManifestDPIAware true
   !define RELEASE_EXE "..\..\target\release\companion-rust.exe"
 !endif
 !ifndef PRODUCT_VERSION
-  !define PRODUCT_VERSION "0.1.0"
+  !define PRODUCT_VERSION "0.2.0"
 !endif
 !ifndef PRODUCT_VERSION_QUAD
   !define PRODUCT_VERSION_QUAD "${PRODUCT_VERSION}.0.0"

@@ -107,6 +107,8 @@ void audio_debug_note_bt_event(
 );
 void audio_set_haptics_buffer_length(uint8_t length);
 uint8_t audio_haptics_buffer_length();
+void audio_set_packet_mode(uint8_t mode);
+uint8_t audio_packet_mode();
 void audio_set_state_data(uint8_t const *data, uint8_t len);
 void audio_set_adaptive_trigger_state(
     uint8_t const *right_trigger,

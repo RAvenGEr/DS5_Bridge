@@ -529,7 +529,9 @@ void __not_in_flash_func(controller_output_state_copy_audio_snapshot)(uint8_t *d
         );
         destination[kHeadphoneVolumeOffset] = kHeadphoneVolumeMax;
         destination[kSpeakerVolumeOffset] = 0x00;
-        destination[kAudioControlOffset] = kAudioFlagsOutputPathHeadphones;
+        destination[kAudioControlOffset] = static_cast<uint8_t>(
+            kAudioFlagsOutputPathHeadphones | kAudioFlagsNoiseCancelEnable
+        );
         return;
     }
 
@@ -539,7 +541,9 @@ void __not_in_flash_func(controller_output_state_copy_audio_snapshot)(uint8_t *d
     destination[kValidFlag1Offset] |= kFlag1AudioControl2Enable;
     destination[kHeadphoneVolumeOffset] = kHeadphoneVolumeMax;
     destination[kSpeakerVolumeOffset] = kSpeakerVolumeMax;
-    destination[kAudioControlOffset] = kAudioFlagsOutputPathSpeaker;
+    destination[kAudioControlOffset] = static_cast<uint8_t>(
+        kAudioFlagsOutputPathSpeaker | kAudioFlagsNoiseCancelEnable
+    );
     destination[kAudioControl2Offset] = static_cast<uint8_t>(
         (destination[kAudioControl2Offset] & 0xF8) | controller_output_state_speaker_gain()
     );

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub const MAGIC: [u8; 4] = [b'D', b'S', b'5', b'B'];
 pub const PROTOCOL_MAJOR: u8 = 1;
-pub const PROTOCOL_MINOR: u8 = 23;
+pub const PROTOCOL_MINOR: u8 = 24;
 pub const REPORT_LENGTH: usize = 64;
 
 pub const REPORT_ID_STATUS: u8 = 0x01;
@@ -56,6 +56,7 @@ mod command_ids {
     pub const COMMAND_ID_SET_LIGHTBAR_RESTORE_ENABLED: u8 = 0x36;
     pub const COMMAND_ID_SET_RADIAL_DEADZONES: u8 = 0x37;
     pub const COMMAND_ID_SET_EDGE_PROFILE_SWITCHING_BLOCKED: u8 = 0x45;
+    pub const COMMAND_ID_SET_AUDIO_PACKET_MODE: u8 = 0x46;
 }
 pub use command_ids::*;
 
@@ -120,6 +121,43 @@ impl HostPersonaMode {
             "ds4" | "ps4" | "dualshock" => HostPersonaMode::Ds4,
             "dualsense-edge" | "edge" => HostPersonaMode::DualSenseEdge,
             _ => HostPersonaMode::DualSense,
+        }
+    }
+}
+
+/// Audio packet mode reported/configured on the bridge: double (0x39, two
+/// frames per report) or single (0x36, one frame per report).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioPacketMode {
+    Double,
+    Single,
+}
+
+impl Default for AudioPacketMode {
+    fn default() -> Self {
+        Self::Double
+    }
+}
+
+impl AudioPacketMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AudioPacketMode::Double => "double",
+            AudioPacketMode::Single => "single",
+        }
+    }
+
+    pub fn parse_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "single" => AudioPacketMode::Single,
+            _ => AudioPacketMode::Double,
+        }
+    }
+
+    pub fn to_protocol_value(self) -> u16 {
+        match self {
+            AudioPacketMode::Single => 1,
+            AudioPacketMode::Double => 0,
         }
     }
 }
@@ -247,6 +285,9 @@ pub struct BridgeStatusPayload {
     pub usb_suspend_disconnect_enabled: bool,
     pub sleep_keybind_enabled: bool,
     pub wake_on_connect_enabled: bool,
+    /// Whether the connected firmware supports audio packet mode control
+    /// (protocol minor >= 24).
+    pub audio_packet_mode_control: bool,
 }
 
 /// Validates report id, magic and protocol version for any inbound report.
@@ -396,6 +437,7 @@ pub fn parse_status_report(report: &[u8]) -> Result<BridgeStatusPayload, Protoco
         usb_suspend_disconnect_enabled: (status_flags & 0x10) != 0,
         sleep_keybind_enabled: (status_flags & 0x40) != 0,
         wake_on_connect_enabled: report[50] == 1,
+        audio_packet_mode_control: report[6] >= 24,
     })
 }
 
@@ -425,8 +467,8 @@ mod tests {
         report[20] = 0x10 | 0x40; // usb suspend disconnect + sleep keybind
         report[21..25].copy_from_slice(&3725u32.to_le_bytes()); // uptime
         report[25] = 1;
-        report[26] = 7;
-        report[27] = 1;
+        report[26] = 8;
+        report[27] = 0;
         report[43..45].copy_from_slice(&30u16.to_le_bytes()); // idle timeout
         report[48] = 7; // DualSense Edge active
         report[49] = 0x01 | 0x02 | 0x04 | 0x80; // supported personas
@@ -442,7 +484,7 @@ mod tests {
         assert_eq!(status.controller_type, "DualSense Edge");
         assert_eq!(status.battery_percent, Some(76));
         assert_eq!(status.host_persona_mode, HostPersonaMode::DualSenseEdge);
-        assert_eq!(status.firmware_version, "1.7.1");
+        assert_eq!(status.firmware_version, "1.8.0");
         assert_eq!(status.uptime_seconds, 3725);
         assert_eq!(status.settings_revision, 42);
         assert!(status.last_command_result.is_ok());
@@ -452,6 +494,7 @@ mod tests {
         assert!(status.usb_suspend_disconnect_enabled);
         assert!(status.sleep_keybind_enabled);
         assert!(status.wake_on_connect_enabled);
+        assert!(status.audio_packet_mode_control);
         assert_eq!(status.supported_persona_mask.count_ones(), 4);
     }
 

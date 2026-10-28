@@ -691,6 +691,17 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
             }
         }
     }
+    // SET_REPORT on the control pipe delivers output report 0x02 with the
+    // report id stripped from the buffer (e.g. Windows HidD_SetOutputReport),
+    // so the payload starts at buffer[0]. Forward it exactly like the
+    // interrupt OUT path above.
+    if (report_type == HID_REPORT_TYPE_OUTPUT && report_id == 0x02) {
+        if (buffer == nullptr || bufsize == 0) {
+            return;
+        }
+        usb_note_hid_output();
+        controller_output_submit_usb_payload(buffer, bufsize);
+    }
     if (
         report_id == 0x80
         || report_id == 0x60

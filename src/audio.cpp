@@ -37,9 +37,18 @@
 #define OUTPUT_CHANNELS   2
 #define SAMPLE_SIZE       64
 #define SPEAKER_OPUS_SIZE 200
-#define AUDIO_BATCH_FRAMES 2
-#define REPORT_SIZE       547
-#define REPORT_ID         0x39
+#define AUDIO_MAX_BATCH_FRAMES 2
+// Double-packet audio report: two haptics frames and two Opus frames.
+#define REPORT_ID_DOUBLE       0x39
+#define REPORT_SIZE_DOUBLE     547
+// Single-packet audio report (v0.7.2 layout): one haptics frame and one Opus
+// frame, sent at twice the rate to trade BT bandwidth for lower latency.
+#define REPORT_ID_SINGLE       0x36
+#define REPORT_SIZE_SINGLE     398
+// Haptics-only report sent while the speaker route is closed: one or two
+// haptics frames without the Opus section.
+#define REPORT_ID_HAPTICS_ONLY 0x32
+#define REPORT_SIZE_HAPTICS_ONLY 142
 #define DEFAULT_HAPTICS_BUFFER_LENGTH 64
 #define MIN_HAPTICS_BUFFER_LENGTH 16
 #define MAX_HAPTICS_BUFFER_LENGTH 128
@@ -179,6 +188,8 @@ static uint32_t test_haptics_cooldown_until_us = 0;
 static bool quiet_mode_enabled = false;
 static volatile uint32_t audio_stream_generation = 1;
 static uint8_t haptics_buffer_length = DEFAULT_HAPTICS_BUFFER_LENGTH;
+// 0 = double packet (0x39), 1 = single packet (0x36).
+static uint8_t packet_mode = 0;
 static critical_section_t audio_debug_cs;
 static bool audio_debug_cs_ready = false;
 static audio_debug_event audio_debug_ring[AUDIO_DEBUG_RING_SIZE];
@@ -216,7 +227,7 @@ struct alignas(8) AudioCore1StackStorage {
 
 static AudioCore1StackStorage audio_core1_stack_storage{};
 static ExactAudioQueue<audio_raw_element, 2> audio_fifo;
-static ExactAudioQueue<speaker_opus_element, AUDIO_BATCH_FRAMES> speaker_opus_fifo;
+static ExactAudioQueue<speaker_opus_element, AUDIO_MAX_BATCH_FRAMES> speaker_opus_fifo;
 static bool speaker_opus_fifo_ready = false;
 static ExactAudioQueue<mic_packet_element, HOST_MIC_QUEUE_DEPTH> mic_fifo;
 static ExactAudioQueue<mic_decode_element, HOST_MIC_QUEUE_DEPTH> mic_decode_fifo;
@@ -231,7 +242,7 @@ static float audio_buf[512 * 2];
 static uint audio_buf_pos = 0;
 static int8_t audio_haptic_buf[SAMPLE_SIZE];
 static int audio_haptic_buf_pos = 0;
-static int8_t pending_audio_haptics[AUDIO_BATCH_FRAMES][SAMPLE_SIZE]{};
+static int8_t pending_audio_haptics[AUDIO_MAX_BATCH_FRAMES][SAMPLE_SIZE]{};
 static uint8_t pending_audio_haptics_count = 0;
 static bool pending_audio_include_speaker = false;
 static bool audio_reactive_haptics_config_enabled = false;
@@ -834,9 +845,13 @@ static uint8_t opus_debug_level() {
         : 0;
 }
 
+static uint8_t audio_batch_frames() {
+    return packet_mode == 1 ? 1 : AUDIO_MAX_BATCH_FRAMES;
+}
+
 static bool speaker_opus_batch_ready() {
     return speaker_opus_fifo_ready
-        && queue_get_level(&speaker_opus_fifo) >= AUDIO_BATCH_FRAMES;
+        && queue_get_level(&speaker_opus_fifo) >= audio_batch_frames();
 }
 
 static void clear_opus_buffer() {
@@ -1066,16 +1081,17 @@ static void update_persistent_speaker_route() {
 }
 
 static bool __not_in_flash_func(try_send_pending_audio_batch)() {
-    if (pending_audio_haptics_count < AUDIO_BATCH_FRAMES) {
+    const uint8_t frames = audio_batch_frames();
+    if (pending_audio_haptics_count < frames) {
         return false;
     }
     if (pending_audio_include_speaker && !speaker_opus_batch_ready()) {
         return false;
     }
 
-    speaker_opus_element speaker_frames[AUDIO_BATCH_FRAMES]{};
+    speaker_opus_element speaker_frames[AUDIO_MAX_BATCH_FRAMES]{};
     if (pending_audio_include_speaker) {
-        for (uint8_t frame = 0; frame < AUDIO_BATCH_FRAMES; frame++) {
+        for (uint8_t frame = 0; frame < frames; frame++) {
             if (!queue_try_remove(&speaker_opus_fifo, &speaker_frames[frame])) {
                 clear_pending_audio_batch();
                 return false;
@@ -1087,28 +1103,16 @@ static bool __not_in_flash_func(try_send_pending_audio_batch)() {
         }
     }
 
-    uint8_t pkt[REPORT_SIZE]{};
-    pkt[0] = REPORT_ID;
+    // Largest of the three layouts; the actual report length is chosen below.
+    uint8_t pkt[REPORT_SIZE_DOUBLE]{};
+    uint16_t report_size = REPORT_SIZE_DOUBLE;
     // The Bluetooth scheduler stamps the shared DualSense output sequence at
     // the actual-send boundary.
     pkt[1] = 0;
-    pkt[2] = 0x11 | (1 << 7);
-    pkt[3] = 6;
     const bool controller_mic_transport_enabled = mic_usb_output_active();
-    pkt[4] = ds5::output::audio_section_enable_mask(controller_mic_transport_enabled);
     const uint8_t buffer_length = haptics_buffer_length;
-    pkt[5] = buffer_length;
-    pkt[6] = buffer_length;
-    pkt[7] = buffer_length;
-    pkt[8] = buffer_length;
-    packetCounter = static_cast<uint8_t>(packetCounter + AUDIO_BATCH_FRAMES);
-    pkt[9] = packetCounter;
-    pkt[10] = 0x12 | (1 << 6) | (1 << 7);
-    pkt[11] = SAMPLE_SIZE;
-    memcpy(pkt + 12, pending_audio_haptics[0], SAMPLE_SIZE);
-    memcpy(pkt + 12 + SAMPLE_SIZE, pending_audio_haptics[1], SAMPLE_SIZE);
-
     const bool speaker_payload_included = pending_audio_include_speaker;
+
     if (speaker_payload_included) {
         const bool force_route = !speaker_route_active || speaker_route_headset != plug_headset;
         if (force_route) {
@@ -1116,25 +1120,92 @@ static bool __not_in_flash_func(try_send_pending_audio_batch)() {
         }
         speaker_route_active = true;
         speaker_route_headset = plug_headset;
+    }
+
+    if (!speaker_payload_included) {
+        // Haptics-only 0x32 report: no Opus section to carry while the
+        // speaker route is closed.
+        report_size = REPORT_SIZE_HAPTICS_ONLY;
+        pkt[0] = REPORT_ID_HAPTICS_ONLY;
+        pkt[2] = 0x11 | (1 << 7);
+        pkt[3] = 4;
+        pkt[4] = static_cast<uint8_t>(
+            ds5::output::kHapticsOnlySectionMask
+            | (controller_mic_transport_enabled
+                ? ds5::output::kAudioSectionControllerMicrophone
+                : 0)
+        );
+        pkt[5] = buffer_length;
+        pkt[6] = buffer_length;
+        packetCounter = static_cast<uint8_t>(packetCounter + frames);
+        pkt[7] = packetCounter;
+        pkt[8] = static_cast<uint8_t>(
+            0x12 | ((frames > 1 ? 1 : 0) << 6) | (1 << 7)
+        );
+        pkt[9] = SAMPLE_SIZE;
+        memcpy(pkt + 10, pending_audio_haptics[0], SAMPLE_SIZE);
+        if (frames > 1) {
+            memcpy(pkt + 10 + SAMPLE_SIZE, pending_audio_haptics[1], SAMPLE_SIZE);
+        }
+    } else if (frames == 1) {
+        // Single-packet 0x36 layout: one haptics frame and one Opus frame.
+        report_size = REPORT_SIZE_SINGLE;
+        pkt[0] = REPORT_ID_SINGLE;
+        pkt[2] = 0x11 | (1 << 7);
+        pkt[3] = 7;
+        pkt[4] = static_cast<uint8_t>(
+            ds5::output::kSinglePacketSectionMaskFlag
+            | ds5::output::audio_section_enable_mask(controller_mic_transport_enabled)
+        );
+        pkt[5] = buffer_length;
+        pkt[6] = buffer_length;
+        pkt[7] = buffer_length;
+        pkt[8] = buffer_length;
+        pkt[9] = buffer_length;
+        packetCounter = static_cast<uint8_t>(packetCounter + 1);
+        pkt[10] = packetCounter;
+        pkt[11] = 0x12 | (1 << 7);
+        pkt[12] = SAMPLE_SIZE;
+        memcpy(pkt + 13, pending_audio_haptics[0], SAMPLE_SIZE);
+        pkt[77] = static_cast<uint8_t>((plug_headset ? 0x16 : 0x13) | (1 << 7));
+        pkt[78] = SPEAKER_OPUS_SIZE;
+        memcpy(pkt + 79, speaker_frames[0].data, SPEAKER_OPUS_SIZE);
+    } else {
+        // Double-packet 0x39 layout: two haptics frames and two Opus frames.
+        pkt[0] = REPORT_ID_DOUBLE;
+        pkt[2] = 0x11 | (1 << 7);
+        pkt[3] = 6;
+        pkt[4] = ds5::output::audio_section_enable_mask(controller_mic_transport_enabled);
+        pkt[5] = buffer_length;
+        pkt[6] = buffer_length;
+        pkt[7] = buffer_length;
+        pkt[8] = buffer_length;
+        packetCounter = static_cast<uint8_t>(packetCounter + AUDIO_MAX_BATCH_FRAMES);
+        pkt[9] = packetCounter;
+        pkt[10] = 0x12 | (1 << 6) | (1 << 7);
+        pkt[11] = SAMPLE_SIZE;
+        memcpy(pkt + 12, pending_audio_haptics[0], SAMPLE_SIZE);
+        memcpy(pkt + 12 + SAMPLE_SIZE, pending_audio_haptics[1], SAMPLE_SIZE);
         pkt[140] = (plug_headset ? 0x16 : 0x13) | (1 << 6) | (1 << 7);
         pkt[141] = SPEAKER_OPUS_SIZE;
         memcpy(pkt + 142, speaker_frames[0].data, SPEAKER_OPUS_SIZE);
         memcpy(pkt + 142 + SPEAKER_OPUS_SIZE, speaker_frames[1].data, SPEAKER_OPUS_SIZE);
-        if (audio_debug_packet_log_budget != 0) {
-            const uint8_t speaker_flags = plug_headset ? 0x01 : 0x00;
-            audio_debug_packet_log_budget--;
-            audio_debug_log(
-                AudioDebugSendSpeakerPacket,
-                clamp_debug_u8(queue_get_level(&audio_fifo)),
-                opus_debug_level(),
-                pkt[9],
-                controller_mic_transport_enabled ? 1 : 0,
-                speaker_flags
-            );
-        }
+    }
+
+    if (speaker_payload_included && audio_debug_packet_log_budget != 0) {
+        const uint8_t speaker_flags = plug_headset ? 0x01 : 0x00;
+        audio_debug_packet_log_budget--;
+        audio_debug_log(
+            AudioDebugSendSpeakerPacket,
+            clamp_debug_u8(queue_get_level(&audio_fifo)),
+            opus_debug_level(),
+            pkt[9],
+            controller_mic_transport_enabled ? 1 : 0,
+            speaker_flags
+        );
     }
 #ifdef ENABLE_COMPANION
-    for (uint8_t frame = 0; frame < AUDIO_BATCH_FRAMES; frame++) {
+    for (uint8_t frame = 0; frame < frames; frame++) {
         companion_note_feedback_trace_samples(
             CompanionFeedbackTraceLocalAudio,
             reinterpret_cast<uint8_t const *>(pending_audio_haptics[frame]),
@@ -1148,7 +1219,7 @@ static bool __not_in_flash_func(try_send_pending_audio_batch)() {
 #endif
 
     clear_pending_audio_batch();
-    return bt_write_audio_stream(pkt, sizeof(pkt));
+    return bt_write_audio_stream(pkt, report_size);
 }
 
 static bool __not_in_flash_func(send_audio_haptics_packet)(
@@ -1157,6 +1228,7 @@ static bool __not_in_flash_func(send_audio_haptics_packet)(
     bool merge_test_overlay = true
 ) {
     bool sent = try_send_pending_audio_batch();
+    const uint8_t frames = audio_batch_frames();
     if (
         pending_audio_haptics_count != 0
         && pending_audio_include_speaker != include_speaker
@@ -1164,13 +1236,13 @@ static bool __not_in_flash_func(send_audio_haptics_packet)(
         clear_pending_audio_batch();
     }
 
-    if (pending_audio_haptics_count == AUDIO_BATCH_FRAMES) {
+    if (frames > 1 && pending_audio_haptics_count == frames) {
         memmove(
             pending_audio_haptics[0],
             pending_audio_haptics[1],
             SAMPLE_SIZE
         );
-        pending_audio_haptics_count = AUDIO_BATCH_FRAMES - 1;
+        pending_audio_haptics_count = frames - 1;
     }
     int8_t *pending = pending_audio_haptics[pending_audio_haptics_count];
     if (haptic_buf != nullptr) {
@@ -1728,6 +1800,21 @@ uint8_t audio_haptics_buffer_length() {
     return haptics_buffer_length;
 }
 
+void audio_set_packet_mode(uint8_t mode) {
+    const uint8_t next_mode = mode == 1 ? 1 : 0;
+    if (packet_mode == next_mode) {
+        return;
+    }
+    packet_mode = next_mode;
+    // A partially accumulated batch belongs to the previous layout; drop it so
+    // the next report starts clean in the new mode.
+    clear_pending_audio_batch();
+}
+
+uint8_t audio_packet_mode() {
+    return packet_mode;
+}
+
 void audio_debug_copy_report_payload(uint8_t *buffer, uint8_t max_len) {
     if (buffer == nullptr || max_len < AUDIO_DEBUG_REPORT_HEADER_SIZE) {
         return;
@@ -1909,7 +1996,7 @@ static bool __not_in_flash_func(process_usb_audio_packet)() {
     const int out_frames = resampler.ResampleOut(out_buf, haptic_input_frames, SAMPLE_SIZE / OUTPUT_CHANNELS, OUTPUT_CHANNELS);
     for (int i = 0; i < out_frames; i++) {
         if (append_resampled_haptic_sample(out_buf[i * OUTPUT_CHANNELS], out_buf[i * OUTPUT_CHANNELS + 1], haptic_gain)) {
-            send_audio_haptics_packet(audio_haptic_buf, true);
+            send_audio_haptics_packet(audio_haptic_buf, speaker_route_active);
         }
     }
     return true;
@@ -2577,7 +2664,7 @@ static bool __not_in_flash_func(core1_process_speaker)() {
 
 static void __not_in_flash_func(core1_entry)() {
     int error = 0;
-    encoder = opus_encoder_create(48000,2,OPUS_APPLICATION_AUDIO,&error);
+    encoder = opus_encoder_create(48000,2,OPUS_APPLICATION_RESTRICTED_CELT,&error);
     if (error != OPUS_OK) {
         DS5_LOG("[Audio] OpusEncoder create failed\n");
         encoder = nullptr;

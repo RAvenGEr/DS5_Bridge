@@ -36,6 +36,9 @@ constexpr uint8_t kFlag2EnableImprovedRumbleEmulation = 0x04;
 constexpr uint8_t kFlag2UseRumbleNotHaptics2 = 0x08;
 constexpr uint8_t kFlag2EdgeProfileSwitchingControlEnable = 0x40;
 
+// NoiseCancelEnable must stay set whenever AudioControl is asserted. Clearing
+// it attenuates the speaker by roughly half until the controller reconnects.
+constexpr uint8_t kAudioFlagsNoiseCancelEnable = 0x08;
 constexpr uint8_t kAudioFlagsOutputPathHeadphones = 0x00;
 constexpr uint8_t kAudioFlagsOutputPathSpeaker = 0x30;
 constexpr uint8_t kAudioFlags2SpeakerPreampGain = 0x02;
@@ -48,6 +51,12 @@ constexpr uint8_t kMicVolumeMax = 0x30;
 // remain clear; bit 0 controls controller-microphone transport.
 constexpr uint8_t kAudioSectionEnableMask = 0x7f;
 constexpr uint8_t kAudioSectionControllerMicrophone = 0x01;
+// 0x36 single-packet reports set bit 7 of the section mask to declare the
+// five-byte buffer-length block instead of the four-byte one.
+constexpr uint8_t kSinglePacketSectionMaskFlag = 0x80;
+// 0x32 haptics-only reports use their own mask layout; bit 0 still flags the
+// controller microphone.
+constexpr uint8_t kHapticsOnlySectionMask = 0x66;
 constexpr uint8_t kControllerMicrophoneTransportBaseMask = 0x02;
 constexpr uint8_t kLightbarSetupLightOut = 0x02;
 constexpr uint8_t kPlayerLed1Instant = 0x24;

@@ -32,7 +32,7 @@ $match = Select-String -Path $cargoToml -Pattern '^version\s*=\s*"([^"]+)"' |
 if (-not $match) { throw "Could not read version from $cargoToml" }
 $version = $match.Matches[0].Groups[1].Value
 
-# VERSIONINFO needs a four-part version: 0.1.0 -> 0.1.0.0
+# VERSIONINFO needs a four-part version: 0.2.0 -> 0.2.0.0
 $parts = @($version -split '\.')
 while ($parts.Count -lt 4) { $parts += '0' }
 $versionQuad = ($parts[0..3]) -join '.'

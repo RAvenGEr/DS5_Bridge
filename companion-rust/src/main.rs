@@ -21,8 +21,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::config::{CompanionConfig, GameRule};
 use crate::protocol::{
     build_bool_report, build_idle_disconnect_timeout_report, build_set_persona_report,
-    build_sleep_controller_report, clamp_idle_disconnect_timeout, AckPayload,
-    BridgeStatusPayload, HostPersonaMode, REPORT_LENGTH,
+    build_sleep_controller_report, build_value_report, clamp_idle_disconnect_timeout, AckPayload,
+    AudioPacketMode, BridgeStatusPayload, COMMAND_ID_SET_AUDIO_PACKET_MODE, HostPersonaMode,
+    REPORT_LENGTH,
 };
 use crate::transport::{PollResult, SendError, TransportManager};
 use crate::tray::{TrayAction, TrayManager};
@@ -140,6 +141,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Last status report seen from the bridge; used to restore the power
     // settings UI when a command is rejected.
     let last_status: Rc<RefCell<Option<BridgeStatusPayload>>> = Rc::new(RefCell::new(None));
+    // Last audio packet mode successfully applied to the bridge, used to
+    // restore the UI toggle when a command is rejected.
+    let applied_packet_mode: Rc<RefCell<AudioPacketMode>> =
+        Rc::new(RefCell::new(AudioPacketMode::Double));
+    let packet_mode_applied_this_connection = Rc::new(Cell::new(false));
     // Last idle-disconnect timeout pushed into the LineEdit, so status polls
     // never overwrite what the user is currently typing.
     let pushed_timeout: Rc<Cell<Option<u16>>> = Rc::new(Cell::new(None));
@@ -172,6 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let cfg = config.borrow();
         window.set_auto_switch_enabled(cfg.auto_switch_enabled);
+        window.set_audio_packet_mode(SharedString::from(cfg.audio_packet_mode.as_str()));
         update_game_rules_ui(&window, &cfg.game_rules);
     }
 
@@ -287,6 +294,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Callback: Audio packet mode (single vs. double packet reporting)
+    {
+        let transport = transport.clone();
+        let sequence = sequence.clone();
+        let config = config.clone();
+        let applied_packet_mode = applied_packet_mode.clone();
+        let packet_mode_applied_this_connection = packet_mode_applied_this_connection.clone();
+        let window_weak = window.as_weak();
+        window.on_set_audio_packet_mode(move |mode_str| {
+            let mode = AudioPacketMode::parse_str(&mode_str);
+            let value = mode.to_protocol_value();
+            let outcome =
+                send_bridge_command(&transport, &sequence, move |seq| {
+                    build_value_report(COMMAND_ID_SET_AUDIO_PACKET_MODE, seq, value)
+                });
+
+            if let Some(ui) = window_weak.upgrade() {
+                let message = format!(
+                    "Audio packet mode set to {}",
+                    mode.as_str()
+                );
+                if report_command_outcome(&ui, &outcome, &message) {
+                    ui.set_audio_packet_mode(SharedString::from(mode.as_str()));
+                    *applied_packet_mode.borrow_mut() = mode;
+                    let mut cfg = config.borrow_mut();
+                    cfg.audio_packet_mode = mode;
+                    cfg.save();
+                    packet_mode_applied_this_connection.set(true);
+                } else {
+                    ui.set_audio_packet_mode(SharedString::from(applied_packet_mode.borrow().as_str()));
+                }
+            }
+        });
+    }
+
     // Callback: Toggle Auto-Switching
     {
         let config = config.clone();
@@ -364,6 +406,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let hwnd_cell = hwnd_cell.clone();
         let last_status = last_status.clone();
         let pushed_timeout = pushed_timeout.clone();
+        let packet_mode_applied_this_connection = packet_mode_applied_this_connection.clone();
+        let applied_packet_mode = applied_packet_mode.clone();
         let mut poll_counter = 0u64;
 
         poll_timer.start(slint::TimerMode::Repeated, std::time::Duration::from_millis(150), move || {
@@ -431,9 +475,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ui.set_uptime_text(SharedString::from(uptime_fmt.as_str()));
 
                         apply_power_status(&ui, &status, &pushed_timeout);
+                        ui.set_audio_packet_mode_supported(status.audio_packet_mode_control);
+                        if status.audio_packet_mode_control
+                            && !packet_mode_applied_this_connection.get()
+                        {
+                            let mode = config.borrow().audio_packet_mode;
+                            let value = mode.to_protocol_value();
+                            let outcome = send_bridge_command(&transport, &sequence, move |seq| {
+                                build_value_report(COMMAND_ID_SET_AUDIO_PACKET_MODE, seq, value)
+                            });
+                            if matches!(&outcome, Ok(ack) if ack.result.is_ok()) {
+                                *applied_packet_mode.borrow_mut() = mode;
+                                packet_mode_applied_this_connection.set(true);
+                                ui.set_audio_packet_mode(SharedString::from(mode.as_str()));
+                            }
+                        }
                         *last_status.borrow_mut() = Some(status);
                     }
                     PollResult::Incompatible { major, minor } => {
+                        packet_mode_applied_this_connection.set(false);
+                        ui.set_audio_packet_mode_supported(false);
                         ui.set_is_connected(true);
                         ui.set_connection_status_text(SharedString::from(format!(
                             "Firmware update required ({}.{})",
@@ -442,6 +503,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ui.set_controller_connected(false);
                     }
                     PollResult::Disconnected => {
+                        packet_mode_applied_this_connection.set(false);
+                        ui.set_audio_packet_mode_supported(false);
                         ui.set_is_connected(false);
                         ui.set_connection_status_text(SharedString::from("Searching for DS5 Bridge..."));
                         ui.set_controller_connected(false);

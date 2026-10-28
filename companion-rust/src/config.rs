@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use directories::ProjectDirs;
 
-use crate::protocol::HostPersonaMode;
+use crate::protocol::{AudioPacketMode, HostPersonaMode};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameRule {
@@ -16,6 +16,8 @@ pub struct GameRule {
 pub struct CompanionConfig {
     pub auto_switch_enabled: bool,
     pub start_minimized: bool,
+    #[serde(default)]
+    pub audio_packet_mode: AudioPacketMode,
     pub game_rules: Vec<GameRule>,
 }
 
@@ -24,6 +26,7 @@ impl Default for CompanionConfig {
         Self {
             auto_switch_enabled: true,
             start_minimized: false,
+            audio_packet_mode: AudioPacketMode::Double,
             game_rules: vec![
                 GameRule {
                     id: "rule-1".to_string(),
