@@ -1,0 +1,14 @@
+/* Wake PC: the intro above the USB wake row and the Wake-on-LAN panel. */
+.settings-page .wake-pc-intro {
+  margin: 0 0 12px;
+  padding: 0 2px;
+  max-width: 72ch;
+  color: var(--text-secondary);
+  font-size: var(--font-size-body);
+  line-height: 1.45;
+}
+
+.settings-page .wake-pc-intro + .settings-menu-row {
+  border-top-left-radius: var(--card-radius);
+  border-top-right-radius: var(--card-radius);
+}

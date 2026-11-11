@@ -1,0 +1,28 @@
+.feature-card-grid {
+  display: grid;
+  grid-template-columns: var(--feature-left-column) var(--feature-right-column);
+  gap: var(--card-gap);
+  min-height: 0;
+  height: auto;
+  align-items: stretch;
+}
+
+.feature-card {
+  --feature-status-grid-rows: var(--feature-card-header-height) 76px var(--action-height) var(--action-height) minmax(40px, 1fr);
+  min-width: 0;
+  min-height: var(--feature-card-min-height);
+  padding: var(--card-padding);
+  border-color: var(--section-border);
+  background: var(--surface-card);
+  box-shadow: var(--shadow-panel);
+}
+
+.haptics-page .feature-card,
+.audio-page .feature-card,
+.triggers-page .feature-card,
+.lighting-page .feature-card,
+.deadzones-page .feature-card,
+.system-page .system-card {
+  min-height: 0;
+  height: auto;
+}

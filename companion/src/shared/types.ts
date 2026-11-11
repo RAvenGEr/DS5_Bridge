@@ -20,20 +20,47 @@ import type {
   MuteButtonMode,
   MuteKeyboardBehavior,
   PollingRateMode,
+  ResetEvidencePayload,
   StickInputPreviewPayload,
   TriggerTestMode
 } from './protocol';
 
-export type UiScalePercent = 75 | 100 | 125 | 150;
-export type UiThemePreset = 'light' | 'dark' | 'bubble-gum' | 'pomegranate' | 'kiwi';
+/** Window scale. 100% renders the 1120x630 CSS layout at the 1.25 base zoom. */
+export type UiScalePercent = 60 | 80 | 100 | 120;
+/** Text-only accessibility scale; geometry stays on the window scale. */
+export type UiTextScalePercent = 80 | 90 | 100 | 110 | 120;
+export type UiThemePreset = import('./ui-theme').UiThemePreset;
+export type UiLocalePreference = import('./ui-locale-matching').UiLocalePreference;
+
+export const UI_SCALE_PERCENTS: readonly UiScalePercent[] = [60, 80, 100, 120];
+export const UI_TEXT_SCALE_PERCENTS: readonly UiTextScalePercent[] = [80, 90, 100, 110, 120];
+export const UI_SCALE_BASE_ZOOM_FACTOR = 1.25;
+
+export function uiScalePercentToZoomFactor(value: UiScalePercent): number {
+  return (value / 100) * UI_SCALE_BASE_ZOOM_FACTOR;
+}
+
+export function isUiScalePercent(value: unknown): value is UiScalePercent {
+  return UI_SCALE_PERCENTS.some((candidate) => candidate === value);
+}
+
+export function isUiTextScalePercent(value: unknown): value is UiTextScalePercent {
+  return UI_TEXT_SCALE_PERCENTS.some((candidate) => candidate === value);
+}
 
 export interface CompanionSettings {
   selectedPresetId: BridgePresetId;
   uiScalePercent: UiScalePercent;
+  uiTextScalePercent: UiTextScalePercent;
   uiThemePreset: UiThemePreset;
+  uiLocale: UiLocalePreference;
   launchAtStartupEnabled: boolean;
   showBatteryPercentTrayIcon: boolean;
+  /** The window's close button quits the app instead of hiding it to the tray. */
+  closeButtonQuits: boolean;
   kitsuneInputPromotionDismissed: boolean;
+  /** Set once the one-time Kitsune Input offer has been shown; it never shows again. */
+  kitsuneInputLaunchOfferShown: boolean;
   firmwareLogDirectory: string | null;
   leftStickRadialDeadzonePercent: number;
   rightStickRadialDeadzonePercent: number;
@@ -53,7 +80,11 @@ export interface CompanionSettings {
   speakerVolumePercent: number;
   speakerGainLevel: number;
   selectedBridgePath: string | null;
+  /** The selected bridge's firmware ID once known; with the path, it keys that bridge's workspace. */
+  selectedBridgeUniqueId: string | null;
   bridgeIdentities: Record<string, BridgeIdentityRecord>;
+  /** Each bridge's own profiles and controller settings, keyed by unique ID or `path:`. */
+  bridgeWorkspaces: Record<string, BridgeWorkspace>;
   controllerBindings: Record<string, string>;
   micVolumePercent: number;
   micMuted: boolean;
@@ -88,6 +119,8 @@ export interface CompanionSettings {
   hostPersonaMode: HostPersonaMode;
   notifyControllerConnection: boolean;
   notifyLowBattery: boolean;
+  notifyPersonaChange: boolean;
+  notifyMicMute: boolean;
   duplexMicEnabled: boolean;
   controllerPowerSavingEnabled: boolean;
   selectedControllerProfileId: string;
@@ -98,6 +131,36 @@ export interface CompanionSettings {
   chordFunctions: ChordFunction[];
   chordAssignments: ChordAssignment[];
 }
+
+/**
+ * The settings that belong to one bridge, as in Kitsune Input: its profiles,
+ * button maps, chords, controller bindings and every controller setting. The
+ * live CompanionSettings hold the selected bridge's workspace; all other
+ * settings stay app-wide.
+ */
+export type BridgeWorkspace = Pick<CompanionSettings,
+  | 'leftStickRadialDeadzonePercent' | 'rightStickRadialDeadzonePercent'
+  | 'hapticsEnabled' | 'hapticsGainPercent' | 'feedbackBoostEnabled' | 'hapticsBufferLength'
+  | 'classicRumbleEnabled' | 'classicRumbleGainPercent' | 'classicRumbleV1Enabled'
+  | 'adaptiveTriggersEnabled' | 'triggerEffectIntensityPercent' | 'triggerTestMode'
+  | 'speakerEnabled' | 'speakerVolumePercent' | 'speakerGainLevel'
+  | 'micVolumePercent' | 'micMuted'
+  | 'audioReactiveHapticsEnabled' | 'audioReactiveHapticsSource' | 'audioReactiveHapticsMode'
+  | 'audioReactiveHapticsGainPercent' | 'audioReactiveHapticsBassFocus' | 'audioReactiveHapticsResponse'
+  | 'audioReactiveHapticsAttack' | 'audioReactiveHapticsRelease'
+  | 'lightbarEnabled' | 'lightbarColor' | 'lightbarBrightnessPercent'
+  | 'lightbarOverrideEnabled' | 'lightbarRestoreEnabled'
+  | 'muteButtonMode' | 'muteKeyboardUsage' | 'muteKeyboardModifiers' | 'muteKeyboardBehavior'
+  | 'muteKeyboardChordStarterEnabled' | 'edgeProfileSwitchingBlocked'
+  | 'ledEnabled' | 'playerLedEnabled' | 'idleDisconnectEnabled' | 'idleDisconnectTimeoutMinutes'
+  | 'usbSuspendDisconnectEnabled' | 'wakeOnConnectEnabled'
+  | 'sleepKeybindEnabled' | 'speakerVolumeShortcutEnabled'
+  | 'pollingRateMode' | 'hostPersonaMode' | 'duplexMicEnabled' | 'controllerPowerSavingEnabled'
+  | 'controllerBindings'
+  | 'selectedControllerProfileId' | 'controllerProfiles'
+  | 'selectedButtonRemappingProfileId' | 'buttonRemappingProfiles' | 'buttonRemappingDraft'
+  | 'chordFunctions' | 'chordAssignments'
+>;
 
 export interface HidDeviceSummary {
   path?: string;
@@ -146,6 +209,8 @@ export interface BridgeDiagnostics {
   lastPollAt: number | null;
   rawDevices: HidDeviceSummary[];
   deviceIdentity: CompanionDeviceIdentityPayload | null;
+  /** Why the bridge last reset; null for firmware without the report. */
+  resetEvidence?: ResetEvidencePayload | null;
   firmwareLogDirectory: string | null;
   firmwareLogPath: string | null;
   firmwareLogEnabled: boolean | null;
@@ -171,6 +236,21 @@ export interface BridgeSnapshot {
   personaTransition?: HostPersonaTransition | null;
   bridgeDevices?: BridgeDeviceCensus | null;
   stickInputPreview?: StickInputPreviewPayload | null;
+  /** Set while the user must enter a face-button sequence to allow UF2 mode. */
+  bootloaderConfirmation?: BootloaderConfirmationPresentation | null;
+}
+
+export type BootloaderConfirmationFaceButton = 'triangle' | 'circle' | 'cross' | 'square';
+
+export interface BootloaderConfirmationPresentation {
+  /** Enrollment pairs this computer with the bridge once; entry repeats per UF2 mount. */
+  purpose: 'enrollment' | 'bootloader-entry';
+  sequence: BootloaderConfirmationFaceButton[];
+  /** Buttons of the sequence entered correctly so far. */
+  progress: number;
+  /** Wrong presses so far; each restarts the sequence. */
+  mistakes: number;
+  expiresAtUnixMs: number;
 }
 
 export interface BridgeDeviceInfo {
@@ -190,7 +270,14 @@ export interface DirectControllerInfo {
 
 export interface BridgeIdentityRecord {
   label: string | null;
+  /** The Windows container of the bridge's latest controller persona. */
   containerId: string | null;
+  /**
+   * Every container the bridge has been seen on, kept once there is more than
+   * one: it reattaches as a different device when a controller connects or
+   * disconnects.
+   */
+  containerIds?: string[];
 }
 
 export interface BridgeDeviceCensus {

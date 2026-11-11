@@ -18,9 +18,26 @@ import type {
   BridgeDiagnostics,
   BridgeSnapshot,
   PicoFirmwareActionResult,
+  UiLocalePreference,
+  UiScalePercent,
+  UiTextScalePercent,
   UiThemePreset,
   WindowsDeviceCleanupResult
 } from './shared/types';
+import type {
+  WakeOnLanConfigurationInput,
+  WakeOnLanMetadata,
+  WakeOnLanReadiness,
+  WakeOnLanTarget
+} from './shared/wake-on-lan-types';
+import type { WakeOnLanResult } from './shared/wake-on-lan-result';
+
+// The sandboxed preload can only require electron, so this mirrors
+// unwrapWakeOnLanResult in shared/wake-on-lan-result.ts.
+function unwrapWakeOnLanResult<T>(result: WakeOnLanResult<T>): T {
+  if (result.ok) return result.value;
+  throw new Error(result.error);
+}
 
 const api = {
   getStatus: (): Promise<BridgeSnapshot> => ipcRenderer.invoke('bridge:getStatus'),
@@ -155,10 +172,17 @@ const api = {
   setShowBatteryPercentTrayIcon: (value: boolean): Promise<BridgeSnapshot> => (
     ipcRenderer.invoke('bridge:setShowBatteryPercentTrayIcon', value)
   ),
-  setKitsuneInputPromotionDismissed: (value: boolean): Promise<BridgeSnapshot> => (
-    ipcRenderer.invoke('bridge:setKitsuneInputPromotionDismissed', value)
+  setCloseButtonQuits: (value: boolean): Promise<BridgeSnapshot> => (
+    ipcRenderer.invoke('bridge:setCloseButtonQuits', value)
   ),
-  setUiScalePercent: (value: number): Promise<BridgeSnapshot> => ipcRenderer.invoke('bridge:setUiScalePercent', value),
+  markKitsuneInputLaunchOfferShown: (): Promise<BridgeSnapshot> => (
+    ipcRenderer.invoke('bridge:markKitsuneInputLaunchOfferShown')
+  ),
+  setUiScalePercent: (value: UiScalePercent): Promise<BridgeSnapshot> => ipcRenderer.invoke('bridge:setUiScalePercent', value),
+  setUiTextScalePercent: (value: UiTextScalePercent): Promise<BridgeSnapshot> => (
+    ipcRenderer.invoke('bridge:setUiTextScalePercent', value)
+  ),
+  setUiLocale: (value: UiLocalePreference): Promise<BridgeSnapshot> => ipcRenderer.invoke('bridge:setUiLocale', value),
   setUiThemePreset: (value: UiThemePreset): Promise<BridgeSnapshot> => (
     ipcRenderer.invoke('bridge:setUiThemePreset', value)
   ),
@@ -177,6 +201,30 @@ const api = {
   mountPicoBootloader: (): Promise<PicoFirmwareActionResult> => (
     ipcRenderer.invoke('bridge:mountPicoBootloader')
   ),
+  cancelBootloaderConfirmation: (): Promise<BridgeSnapshot> => (
+    ipcRenderer.invoke('bridge:cancelBootloaderConfirmation')
+  ),
+  getWakeOnLan: async (): Promise<WakeOnLanMetadata> => unwrapWakeOnLanResult(
+    await ipcRenderer.invoke('bridge:getWakeOnLan')
+  ),
+  getWakeOnLanTargets: async (refresh = false): Promise<WakeOnLanTarget[]> => unwrapWakeOnLanResult(
+    await ipcRenderer.invoke('bridge:getWakeOnLanTargets', refresh)
+  ),
+  getWakeOnLanReadiness: async (targetMac: string, refresh = false): Promise<WakeOnLanReadiness> => unwrapWakeOnLanResult(
+    await ipcRenderer.invoke('bridge:getWakeOnLanReadiness', targetMac, refresh)
+  ),
+  configureWakeOnLan: async (input: WakeOnLanConfigurationInput): Promise<WakeOnLanMetadata> => unwrapWakeOnLanResult(
+    await ipcRenderer.invoke('bridge:configureWakeOnLan', input)
+  ),
+  setWakeOnLanEnabled: async (enabled: boolean): Promise<WakeOnLanMetadata> => unwrapWakeOnLanResult(
+    await ipcRenderer.invoke('bridge:setWakeOnLanEnabled', enabled)
+  ),
+  forgetWakeOnLan: async (): Promise<WakeOnLanMetadata> => unwrapWakeOnLanResult(
+    await ipcRenderer.invoke('bridge:forgetWakeOnLan')
+  ),
+  cancelWakeOnLan: async (): Promise<void> => unwrapWakeOnLanResult(
+    await ipcRenderer.invoke('bridge:cancelWakeOnLan')
+  ),
   flashPicoFirmware: (): Promise<PicoFirmwareActionResult> => (
     ipcRenderer.invoke('bridge:flashPicoFirmware')
   ),
@@ -188,6 +236,12 @@ const api = {
   ),
   setNotifyLowBattery: (value: boolean): Promise<BridgeSnapshot> => (
     ipcRenderer.invoke('bridge:setNotifyLowBattery', value)
+  ),
+  setNotifyPersonaChange: (value: boolean): Promise<BridgeSnapshot> => (
+    ipcRenderer.invoke('bridge:setNotifyPersonaChange', value)
+  ),
+  setNotifyMicMute: (value: boolean): Promise<BridgeSnapshot> => (
+    ipcRenderer.invoke('bridge:setNotifyMicMute', value)
   ),
   testNotification: (): Promise<BridgeSnapshot> => ipcRenderer.invoke('bridge:testNotification'),
   testHaptics: (): Promise<BridgeSnapshot> => ipcRenderer.invoke('bridge:testHaptics'),
@@ -247,6 +301,7 @@ const api = {
     ipcRenderer.invoke('bridge:clearFirmwareLogDirectory')
   ),
   getDiagnostics: (): Promise<BridgeDiagnostics> => ipcRenderer.invoke('bridge:getDiagnostics'),
+  getAppVersion: (): Promise<string> => ipcRenderer.invoke('app:getVersion'),
   minimizeWindow: (): Promise<void> => ipcRenderer.invoke('window:minimize'),
   toggleMaximizeWindow: (): Promise<void> => ipcRenderer.invoke('window:toggleMaximize'),
   isWindowMaximized: (): Promise<boolean> => ipcRenderer.invoke('window:isMaximized'),

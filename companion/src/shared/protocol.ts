@@ -1,10 +1,15 @@
+import type { BootloaderConfirmationFaceButton } from './types';
+
 export const COMPANION_USAGE_PAGE = 0xff5d;
 export const COMPANION_USAGE = 0x0001;
 export const REPORT_LENGTH = 64;
 export const PAYLOAD_LENGTH = 63;
 export const MAGIC = 'DS5B';
 export const PROTOCOL_MAJOR = 1;
-export const PROTOCOL_MINOR = 23;
+export const PROTOCOL_MINOR = 24;
+// Firmware from this minor authenticates bootloader entry; older firmware still
+// takes the plain ENTER_BOOTLOADER command so it can be updated.
+export const BOOTLOADER_AUTHORIZATION_PROTOCOL_MINOR = 24;
 
 export const REPORT_ID = {
   STATUS: 0x01,
@@ -17,7 +22,10 @@ export const REPORT_ID = {
   TRIGGER_TRACE: 0x09,
   FEEDBACK_TRACE: 0x0a,
   DEVICE_IDENTITY: 0x0d,
-  FIRMWARE_LOG: 0x0e
+  FIRMWARE_LOG: 0x0e,
+  BOOTLOADER_AUTHORIZATION: 0x12,
+  RESET_EVIDENCE: 0x13,
+  WAKE_ON_LAN: 0x1d
 } as const;
 
 export const SHORTCUT_EVENT = {
@@ -98,7 +106,15 @@ export const COMMAND_ID = {
   SET_WAKE_ON_CONNECT: 0x35,
   SET_LIGHTBAR_RESTORE_ENABLED: 0x36,
   SET_RADIAL_DEADZONES: 0x37,
-  SET_EDGE_PROFILE_SWITCHING_BLOCKED: 0x45
+  SET_EDGE_PROFILE_SWITCHING_BLOCKED: 0x45,
+  BOOTLOADER_AUTH_ENROLL_BEGIN: 0x50,
+  BOOTLOADER_AUTH_ENROLL_COMMIT: 0x51,
+  BOOTLOADER_AUTH_CHALLENGE: 0x52,
+  BOOTLOADER_AUTH_REVOKE: 0x53,
+  BOOTLOADER_AUTH_CONFIRMATION_CANCEL: 0x54,
+  BOOTLOADER_AUTH_PHYSICAL_BEGIN: 0x55,
+  // The Wake-on-LAN opcode travels in value (see wake-on-lan-protocol.ts).
+  WAKE_ON_LAN: 0x57
 } as const;
 
 export const RADIAL_DEADZONE_MAX_PERCENT = 50;
@@ -125,7 +141,8 @@ export const ACK_RESULT = {
   ERR_UNKNOWN_COMMAND: 0x05,
   ERR_NOT_CONNECTED: 0x06,
   ERR_BUSY: 0x07,
-  ERR_PERSISTENCE_FAILED: 0x08
+  ERR_PERSISTENCE_FAILED: 0x08,
+  ERR_UNAUTHORIZED: 0x09
 } as const;
 
 export type AckResultCode = typeof ACK_RESULT[keyof typeof ACK_RESULT];
@@ -247,6 +264,7 @@ export type ChordControllerSettingAction =
   | 'toggle-lightbar-override'
   | 'toggle-mic-mute'
   | 'sleep-controller'
+  | 'show-battery'
   | 'persona-dualsense'
   | 'persona-dualsense-edge'
   | 'persona-ds4'
@@ -660,6 +678,11 @@ export interface ReportProtocolVersion {
   minor: number;
 }
 
+/** Length, report ID and DS5B magic; the caller checks the version. */
+export function assertCompanionReport(report: ArrayLike<number>, reportId: number): void {
+  assertReport(report, reportId);
+}
+
 function assertReport(report: ArrayLike<number>, reportId: number): void {
   if (report.length !== REPORT_LENGTH) {
     throw new ProtocolError(`Expected ${REPORT_LENGTH} bytes, received ${report.length}.`, 'bad-length');
@@ -691,6 +714,128 @@ function assertCurrentOrOlderVersion(report: ArrayLike<number>): void {
   }
 }
 
+const BOOTLOADER_CONFIRMATION_FACE_BUTTONS = [
+  'triangle',
+  'circle',
+  'cross',
+  'square'
+] as const satisfies readonly BootloaderConfirmationFaceButton[];
+
+export interface BootloaderAuthorizationPayload {
+  schemaVersion: number;
+  authorized: boolean;
+  enrollmentPending: boolean;
+  enrollmentPhysicallyConfirmed: boolean;
+  challengeActive: boolean;
+  rateLimited: boolean;
+  bootloaderEntryConfirmationPending: boolean;
+  bootloaderEntryPhysicallyConfirmed: boolean;
+  keyId: number[];
+  challengeId: number;
+  nonce: number[];
+  challengeRemainingMs: number;
+  confirmationSequence: BootloaderConfirmationFaceButton[];
+  confirmationProgress: number;
+  confirmationMistakes: number;
+  confirmationRemainingMs: number;
+  protocolVersion: string;
+}
+
+// Ported from Kitsune Input's bootloader authorization report.
+export function parseBootloaderAuthorizationReport(
+  report: ArrayLike<number>
+): BootloaderAuthorizationPayload {
+  assertReport(report, REPORT_ID.BOOTLOADER_AUTHORIZATION);
+  if (report[5] !== PROTOCOL_MAJOR
+    || report[6] < BOOTLOADER_AUTHORIZATION_PROTOCOL_MINOR
+    || report[6] > PROTOCOL_MINOR) {
+    throw new ProtocolError(
+      `Firmware update required. Expected bootloader authorization protocol ${PROTOCOL_MAJOR}.${BOOTLOADER_AUTHORIZATION_PROTOCOL_MINOR}-${PROTOCOL_MAJOR}.${PROTOCOL_MINOR}, received ${report[5]}.${report[6]}.`,
+      'bad-version'
+    );
+  }
+  const flags = report[8];
+  const confirmationSequence = Array.from({ length: 8 }, (_, index) => {
+    const value = report[37 + index];
+    const button = BOOTLOADER_CONFIRMATION_FACE_BUTTONS[value];
+    if (!button) {
+      throw new ProtocolError(`Invalid bootloader confirmation face button ${value}.`, 'bad-confirmation-sequence');
+    }
+    return button;
+  });
+  return {
+    schemaVersion: report[7],
+    authorized: (flags & 0x01) !== 0,
+    enrollmentPending: (flags & 0x02) !== 0,
+    enrollmentPhysicallyConfirmed: (flags & 0x04) !== 0,
+    challengeActive: (flags & 0x08) !== 0,
+    rateLimited: (flags & 0x10) !== 0,
+    bootloaderEntryConfirmationPending: (flags & 0x20) !== 0,
+    bootloaderEntryPhysicallyConfirmed: (flags & 0x40) !== 0,
+    keyId: Array.from({ length: 4 }, (_, index) => report[9 + index]),
+    challengeId: readU32(report, 13),
+    nonce: Array.from({ length: 16 }, (_, index) => report[17 + index]),
+    challengeRemainingMs: readU32(report, 33),
+    confirmationSequence,
+    confirmationProgress: Math.min(report[45], confirmationSequence.length),
+    confirmationMistakes: report[46],
+    confirmationRemainingMs: readU32(report, 49),
+    protocolVersion: `${report[5]}.${report[6]}`
+  };
+}
+
+// Names match watchdog_telemetry_phase_name/_reason_name in
+// src/watchdog_telemetry.cpp, indexed by the firmware enums.
+export const RESET_EVIDENCE_PHASES = [
+  'boot', 'cyw43', 'tinyusb', 'interrupt-before-audio', 'usb-power', 'audio', 'button',
+  'lightbar', 'rssi', 'inquiry', 'connection-recovery', 'feature-prefetch', 'output-retry',
+  'companion', 'interrupt-after-companion', 'firmware-log-flush', 'cyw43-second',
+  'interrupt-after-cyw43', 'wake-on-lan', 'wifi-start', 'wifi-join', 'wifi-send', 'wifi-stop',
+  'wake-on-lan-storage'
+] as const;
+export const RESET_EVIDENCE_REASONS = [
+  'watchdog-timeout', 'panic', 'out-of-memory', 'codec-fatal', 'audio-stack-overflow',
+  'container-contract', 'cyw43-rx-overflow', 'wifi-teardown'
+] as const;
+
+/** Why the bridge last reset, as the firmware captured it at boot. */
+export interface ResetEvidencePayload {
+  /** The current boot followed a watchdog reset: a crash, a hang or a deliberate recovery. */
+  watchdogReset: boolean;
+  /** The breadcrumb survived the reset, so phase, reason and uptime are meaningful. */
+  evidenceValid: boolean;
+  phase: string;
+  reason: string;
+  /** Consecutive abnormal resets since the last clean boot (saturates at 255). */
+  consecutiveAbnormalResets: number;
+  /** Uptime at the last heartbeat before the reset, 1 s resolution. */
+  uptimeBeforeResetMs: number;
+  /** Reason-specific evidence, such as the CYW43 receive counts. */
+  detail: number;
+  /** The bridge's uptime when this report was read. */
+  uptimeMs: number;
+}
+
+export function parseResetEvidenceReport(report: ArrayLike<number>): ResetEvidencePayload {
+  assertReport(report, REPORT_ID.RESET_EVIDENCE);
+  assertCurrentOrOlderVersion(report);
+  if (report[7] !== 1) {
+    throw new ProtocolError(`Unsupported reset evidence schema ${report[7]}.`, 'bad-reset-evidence');
+  }
+  const flags = report[8];
+  const evidenceValid = (flags & 0x02) !== 0;
+  return {
+    watchdogReset: (flags & 0x01) !== 0,
+    evidenceValid,
+    phase: evidenceValid ? RESET_EVIDENCE_PHASES[report[9]] ?? 'unknown' : 'unknown',
+    reason: evidenceValid ? RESET_EVIDENCE_REASONS[report[10]] ?? 'unknown' : 'unknown',
+    consecutiveAbnormalResets: report[11],
+    uptimeBeforeResetMs: evidenceValid ? readU32(report, 12) : 0,
+    detail: evidenceValid ? readU32(report, 16) : 0,
+    uptimeMs: readU32(report, 20)
+  };
+}
+
 export function readReportProtocolVersion(
   report: ArrayLike<number>,
   reportId: number
@@ -704,6 +849,10 @@ export function readReportProtocolVersion(
 
 function readU16(report: ArrayLike<number>, offset: number): number {
   return report[offset] | (report[offset + 1] << 8);
+}
+
+export function readWireU32(report: ArrayLike<number>, offset: number): number {
+  return readU32(report, offset);
 }
 
 function readU32(report: ArrayLike<number>, offset: number): number {

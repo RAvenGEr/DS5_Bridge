@@ -14,6 +14,9 @@ extern uint8_t usb_host_volume_percent[3]; // Speaker, mic, raw line capture.
 extern uint8_t usb_host_mute[3]; // Speaker, mic, raw line capture.
 extern uint32_t usb_host_volume_set_count[3];
 extern float usb_host_speaker_gain; // Host UAC speaker volume as linear gain.
+// Microphone channels of the descriptor the host enumerated. A persona change
+// selects new descriptors before the old attachment is retired.
+extern volatile uint8_t usb_mic_endpoint_channels;
 
 void usb_device_stack_init_disconnected();
 uint8_t usb_hid_polling_rate_mode();
@@ -28,6 +31,12 @@ bool usb_host_suspended_active();
 bool usb_speaker_streaming_active();
 bool usb_mic_streaming_active();
 bool usb_line_streaming_active();
+// Wake-on-LAN observations, sampled from the main loop.
+bool usb_wake_host_active();
+bool usb_wake_external_suspended();
+bool usb_wake_host_firmware();
+// Stops USB audio streams and drops their queued samples while Wi-Fi runs.
+void usb_set_gameplay_quiet(bool quiet);
 bool usb_mounted_active();
 void usb_handle_controller_transport_disconnect(bool expected_disconnect = false);
 void usb_handle_controller_link_connected();

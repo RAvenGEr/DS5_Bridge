@@ -1,5 +1,7 @@
 #include <array>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <iostream>
@@ -151,7 +153,7 @@ void reset_policy_state() {
     controller_output_policy_set_classic_rumble_gain(100);
     controller_output_policy_set_classic_rumble_v1_enabled(false);
     controller_output_policy_set_audio_haptics_replace_requested(false);
-    controller_output_policy_set_audio_haptics_replace_producer_active(false);
+    controller_output_policy_reset_audio_haptics_producer();
 }
 
 void reset_output_state() {
@@ -438,38 +440,62 @@ void classic_rumble_gain_clamps_rounds_and_touches_motor_payloads() {
     reset_policy_state();
 }
 
-void audio_haptics_replace_tracks_state_without_suppressing_classic_rumble() {
+void audio_haptics_replace_suppresses_rumble_only_while_producer_is_live() {
     reset_policy_state();
     controller_output_policy_set_classic_rumble_gain(175);
     controller_output_policy_set_audio_haptics_replace_requested(true);
 
+    // Requested without a live producer: game rumble keeps flowing, scaled.
     EXPECT_FALSE(controller_output_policy_audio_haptics_replace_active());
-    EXPECT_EQ(controller_output_policy_scale_classic_rumble_byte(40), 70);
+    auto idle_payload = empty_payload();
+    idle_payload[kValidFlag0Offset] = kFlag0CompatibleVibration | kFlag0HapticsSelect;
+    idle_payload[kMotorRightOffset] = 40;
+    idle_payload[kMotorLeftOffset] = 80;
+    EXPECT_TRUE(controller_output_policy_apply_classic_rumble_gain_payload(idle_payload.data(), idle_payload.size()));
+    EXPECT_EQ(idle_payload[kMotorRightOffset], 70);
+    EXPECT_EQ(idle_payload[kMotorLeftOffset], 140);
 
-    controller_output_policy_set_audio_haptics_replace_producer_active(true);
-
+    // The first producer frame takes ownership.
+    EXPECT_TRUE(controller_output_policy_note_audio_haptics_producer_frame(1'000'000));
+    EXPECT_FALSE(controller_output_policy_note_audio_haptics_producer_frame(1'010'000));
     EXPECT_TRUE(controller_output_policy_audio_haptics_replace_active());
     EXPECT_EQ(controller_output_policy_classic_rumble_gain(), 175);
-    EXPECT_EQ(controller_output_policy_scale_classic_rumble_byte(200), 255);
 
+    // Rumble flags and motors are stripped; unrelated fields are untouched.
     auto payload = empty_payload();
     payload[kValidFlag0Offset] = kFlag0CompatibleVibration | kFlag0HapticsSelect | kFlag0RightTriggerEffect;
     payload[kValidFlag2Offset] = kFlag2EnableImprovedRumbleEmulation | kFlag2LightbarSetupControlEnable;
     payload[kMotorRightOffset] = 40;
     payload[kMotorLeftOffset] = 80;
     EXPECT_TRUE(controller_output_policy_apply_classic_rumble_gain_payload(payload.data(), payload.size()));
-    EXPECT_EQ(payload[kValidFlag0Offset], kFlag0CompatibleVibration | kFlag0HapticsSelect | kFlag0RightTriggerEffect);
-    EXPECT_EQ(payload[kValidFlag2Offset], kFlag2EnableImprovedRumbleEmulation | kFlag2LightbarSetupControlEnable);
-    EXPECT_EQ(payload[kMotorRightOffset], 70);
-    EXPECT_EQ(payload[kMotorLeftOffset], 140);
+    EXPECT_EQ(payload[kValidFlag0Offset], kFlag0RightTriggerEffect);
+    EXPECT_EQ(payload[kValidFlag2Offset], kFlag2LightbarSetupControlEnable);
+    EXPECT_EQ(payload[kMotorRightOffset], 0);
+    EXPECT_EQ(payload[kMotorLeftOffset], 0);
 
-    controller_output_policy_set_audio_haptics_replace_producer_active(false);
-    EXPECT_EQ(controller_output_policy_classic_rumble_gain(), 175);
+    // The lease holds just under the timeout and releases at it, including
+    // across 32-bit timer wrap.
+    EXPECT_FALSE(controller_output_policy_poll_audio_haptics_producer(
+        1'010'000 + kAudioHapticsProducerLeaseTimeoutUs - 1
+    ));
+    EXPECT_TRUE(controller_output_policy_audio_haptics_replace_active());
+    EXPECT_TRUE(controller_output_policy_poll_audio_haptics_producer(
+        1'010'000 + kAudioHapticsProducerLeaseTimeoutUs
+    ));
+    EXPECT_FALSE(controller_output_policy_audio_haptics_replace_active());
     EXPECT_EQ(controller_output_policy_scale_classic_rumble_byte(40), 70);
 
-    controller_output_policy_set_audio_haptics_replace_producer_active(true);
+    const uint32_t near_wrap = 0xffff'fff0u;
+    EXPECT_TRUE(controller_output_policy_note_audio_haptics_producer_frame(near_wrap));
+    EXPECT_FALSE(controller_output_policy_poll_audio_haptics_producer(near_wrap + 1'000));
     EXPECT_TRUE(controller_output_policy_audio_haptics_replace_active());
+
+    // Withdrawing the request or resetting the producer ends ownership.
     controller_output_policy_set_audio_haptics_replace_requested(false);
+    EXPECT_FALSE(controller_output_policy_audio_haptics_replace_active());
+    controller_output_policy_set_audio_haptics_replace_requested(true);
+    EXPECT_TRUE(controller_output_policy_audio_haptics_replace_active());
+    controller_output_policy_reset_audio_haptics_producer();
     EXPECT_FALSE(controller_output_policy_audio_haptics_replace_active());
     reset_policy_state();
 }
@@ -541,24 +567,32 @@ void lightbar_override_removes_host_led_claims_without_mutating_color_bytes() {
     EXPECT_EQ(payload[kLightbarBlueOffset], 7);
 }
 
-void host_led_clear_detection_covers_release_player_and_lightbar_paths() {
+void host_lightbar_clear_detection_covers_release_and_blank_lightbar_only() {
     auto payload = empty_payload();
-    EXPECT_FALSE(controller_output_policy_host_output_clears_leds(payload.data(), payload.size()));
+    EXPECT_FALSE(controller_output_policy_host_output_clears_lightbar(payload.data(), payload.size()));
+    EXPECT_FALSE(controller_output_policy_host_output_sets_lightbar(payload.data(), payload.size()));
 
     payload[kValidFlag1Offset] = kFlag1ReleaseLeds;
-    EXPECT_TRUE(controller_output_policy_host_output_clears_leds(payload.data(), payload.size()));
+    EXPECT_TRUE(controller_output_policy_host_output_clears_lightbar(payload.data(), payload.size()));
 
+    // Turning the player LEDs off leaves the game's lightbar color alone.
     payload = empty_payload();
     payload[kValidFlag1Offset] = kFlag1PlayerIndicatorControlEnable;
     payload[kPlayerLedsOffset] = 0;
-    EXPECT_TRUE(controller_output_policy_host_output_clears_leds(payload.data(), payload.size()));
+    EXPECT_FALSE(controller_output_policy_host_output_clears_lightbar(payload.data(), payload.size()));
 
     payload = empty_payload();
-    payload[kValidFlag1Offset] = kFlag1LightbarControlEnable;
+    payload[kValidFlag1Offset] = kFlag1LightbarControlEnable | kFlag1PlayerIndicatorControlEnable;
     payload[kLightbarRedOffset] = 1;
-    EXPECT_FALSE(controller_output_policy_host_output_clears_leds(payload.data(), payload.size()));
+    EXPECT_FALSE(controller_output_policy_host_output_clears_lightbar(payload.data(), payload.size()));
+    EXPECT_TRUE(controller_output_policy_host_output_sets_lightbar(payload.data(), payload.size()));
     payload[kLightbarRedOffset] = 0;
-    EXPECT_TRUE(controller_output_policy_host_output_clears_leds(payload.data(), payload.size()));
+    EXPECT_TRUE(controller_output_policy_host_output_clears_lightbar(payload.data(), payload.size()));
+    EXPECT_FALSE(controller_output_policy_host_output_sets_lightbar(payload.data(), payload.size()));
+
+    payload[kLightbarBlueOffset] = 9;
+    payload[kValidFlag1Offset] |= kFlag1ReleaseLeds;
+    EXPECT_FALSE(controller_output_policy_host_output_sets_lightbar(payload.data(), payload.size()));
 }
 
 void output_state_audio_snapshot_routes_to_speaker_and_headphones_safely() {
@@ -644,11 +678,11 @@ void output_state_lightbar_override_is_scaled_and_survives_audio_snapshot() {
     controller_output_state_copy_audio_snapshot(snapshot.data(), false);
 
     EXPECT_TRUE((snapshot[kValidFlag1Offset] & kFlag1LightbarControlEnable) != 0);
-    EXPECT_FALSE((snapshot[kValidFlag1Offset] & kFlag1PlayerIndicatorControlEnable) != 0);
+    EXPECT_TRUE((snapshot[kValidFlag1Offset] & kFlag1PlayerIndicatorControlEnable) != 0);
     EXPECT_FALSE((snapshot[kValidFlag1Offset] & kFlag1ReleaseLeds) != 0);
     EXPECT_EQ(snapshot[kValidFlag2Offset] & kLightbarSetupControlMask, 0);
     EXPECT_EQ(snapshot[kLedBrightnessOffset], 1);
-    EXPECT_EQ(snapshot[kPlayerLedsOffset], 0);
+    EXPECT_EQ(snapshot[kPlayerLedsOffset], kPlayerLed1Instant);
     EXPECT_EQ(snapshot[kLightbarRedOffset], 100);
     EXPECT_EQ(snapshot[kLightbarGreenOffset], 40);
     EXPECT_EQ(snapshot[kLightbarBlueOffset], 20);
@@ -724,6 +758,73 @@ void output_state_player_led_release_invalidates_cached_indicator() {
 
     Payload report{};
     EXPECT_FALSE(controller_output_state_copy_player_led_report(report.data(), static_cast<uint16_t>(report.size())));
+}
+
+// Player LEDs on with nothing from the host shows player 1, not dark LEDs
+// (GitHub #59). The fallback never counts as a host pattern.
+void output_state_player_led_falls_back_to_player_one_until_host_sets_it() {
+    reset_output_state();
+    controller_output_state_set_lightbar(0, 0, 255, 100);
+
+    AudioSnapshot snapshot{};
+    controller_output_state_copy_audio_snapshot(snapshot.data(), false);
+    EXPECT_TRUE((snapshot[kValidFlag1Offset] & kFlag1PlayerIndicatorControlEnable) != 0);
+    EXPECT_EQ(snapshot[kPlayerLedsOffset], kPlayerLed1Instant);
+
+    Payload report{};
+    EXPECT_TRUE(controller_output_state_copy_player_led_report(report.data(), static_cast<uint16_t>(report.size())));
+    EXPECT_TRUE((report[kValidFlag1Offset] & kFlag1PlayerIndicatorControlEnable) != 0);
+    EXPECT_EQ(report[kPlayerLedsOffset], kPlayerLed1Instant);
+
+    // A host report that leaves the player LEDs alone keeps the fallback,
+    // and a later release is still honored: the fallback was not cached.
+    auto rumble_only = empty_payload();
+    rumble_only[kValidFlag0Offset] = kFlag0CompatibleVibration;
+    rumble_only[kMotorRightOffset] = 0x40;
+    controller_output_state_apply_host_payload(rumble_only.data(), static_cast<uint8_t>(rumble_only.size()));
+    controller_output_state_copy_audio_snapshot(snapshot.data(), false);
+    EXPECT_EQ(snapshot[kPlayerLedsOffset], kPlayerLed1Instant);
+
+    auto release_payload = empty_payload();
+    release_payload[kValidFlag1Offset] = kFlag1ReleaseLeds;
+    controller_output_state_apply_host_payload(release_payload.data(), static_cast<uint8_t>(release_payload.size()));
+    controller_output_state_copy_audio_snapshot(snapshot.data(), false);
+    EXPECT_FALSE((snapshot[kValidFlag1Offset] & kFlag1PlayerIndicatorControlEnable) != 0);
+    EXPECT_EQ(snapshot[kPlayerLedsOffset], 0);
+    EXPECT_FALSE(controller_output_state_copy_player_led_report(report.data(), static_cast<uint16_t>(report.size())));
+
+    // The host's own pattern replaces the fallback.
+    auto host_pattern = empty_payload();
+    host_pattern[kValidFlag1Offset] = kFlag1PlayerIndicatorControlEnable;
+    host_pattern[kPlayerLedsOffset] = 0x0a;
+    controller_output_state_apply_host_payload(host_pattern.data(), static_cast<uint8_t>(host_pattern.size()));
+    controller_output_state_copy_audio_snapshot(snapshot.data(), false);
+    EXPECT_TRUE((snapshot[kValidFlag1Offset] & kFlag1PlayerIndicatorControlEnable) != 0);
+    EXPECT_EQ(snapshot[kPlayerLedsOffset], 0x0a);
+
+    // A reconnect forgets the host's choice, so player 1 shows again.
+    controller_output_state_reset_cached_player_leds();
+    controller_output_state_copy_audio_snapshot(snapshot.data(), false);
+    EXPECT_EQ(snapshot[kPlayerLedsOffset], kPlayerLed1Instant);
+
+    // Short host reports (hidapi on Linux and macOS) reach the controller
+    // zero-padded, so they set the pattern too and the bridge must follow.
+    Payload short_report = empty_payload();
+    short_report[kValidFlag1Offset] = kFlag1PlayerIndicatorControlEnable;
+    short_report[kPlayerLedsOffset] = 0x0a;
+    controller_output_state_apply_host_payload(short_report.data(), static_cast<uint8_t>(kPlayerLedsOffset + 1));
+    EXPECT_TRUE(controller_output_state_copy_player_led_report(report.data(), static_cast<uint16_t>(report.size())));
+    EXPECT_EQ(report[kPlayerLedsOffset], 0x0a);
+    controller_output_state_apply_host_payload(short_report.data(), static_cast<uint8_t>(kPlayerLedsOffset));
+    EXPECT_TRUE(controller_output_state_copy_player_led_report(report.data(), static_cast<uint16_t>(report.size())));
+    EXPECT_EQ(report[kPlayerLedsOffset], 0);
+    controller_output_state_reset_cached_player_leds();
+
+    // Player LEDs off still forces them dark.
+    controller_output_state_set_player_led_enabled(false);
+    controller_output_state_copy_audio_snapshot(snapshot.data(), false);
+    EXPECT_TRUE((snapshot[kValidFlag1Offset] & kFlag1PlayerIndicatorControlEnable) != 0);
+    EXPECT_EQ(snapshot[kPlayerLedsOffset], 0);
 }
 
 void output_state_preserves_selector_zero_and_ignores_motor_only_rumble() {
@@ -1097,9 +1198,15 @@ void dualsense_decoder_interprets_battery_power_states() {
     EXPECT_EQ(state.battery_percent, 85);
     EXPECT_EQ(state.raw_power_state, 1);
 
+    // External power (state 2) keeps the real capacity rather than reading 100%.
+    report[52] = 0x24;
+    EXPECT_TRUE(dualsense_decode_usb_input_report(report.data(), report.size(), state));
+    EXPECT_EQ(state.battery_percent, 45);
+    EXPECT_EQ(state.raw_power_state, 2);
+
     report[52] = 0x28;
     EXPECT_TRUE(dualsense_decode_usb_input_report(report.data(), report.size(), state));
-    EXPECT_EQ(state.battery_percent, 100);
+    EXPECT_EQ(state.battery_percent, 85);
     EXPECT_EQ(state.raw_power_state, 2);
 
     report[52] = 0x2a;
@@ -1109,7 +1216,7 @@ void dualsense_decoder_interprets_battery_power_states() {
 
     report[52] = 0x2f;
     EXPECT_TRUE(dualsense_decode_usb_input_report(report.data(), report.size(), state));
-    EXPECT_EQ(state.battery_percent, 100);
+    EXPECT_EQ(state.battery_percent, 0xff);
     EXPECT_EQ(state.raw_power_state, 2);
 
     report[52] = 0xa8;
@@ -1238,6 +1345,36 @@ void xusb360_persona_maps_standard_gamepad_fields() {
     EXPECT_EQ(encoded.bytes[5], 0xcc);
 }
 
+void xusb360_persona_centers_sticks_and_reaches_both_endpoints() {
+    const auto axis = [](HostPersonaInputReport const &report, size_t offset) {
+        return static_cast<int16_t>(report.bytes[offset] | (report.bytes[offset + 1] << 8));
+    };
+    const auto encode = [](uint8_t x, uint8_t y) {
+        BridgeControllerState state{};
+        state.left_stick_x = x;
+        state.left_stick_y = y;
+        state.right_stick_x = x;
+        state.right_stick_y = y;
+        HostPersonaInputReport encoded{};
+        EXPECT_TRUE(host_persona_encode_input(HostPersonaModeXusb360, state, encoded));
+        return encoded;
+    };
+
+    const auto centered = encode(128, 128);
+    EXPECT_EQ(axis(centered, 6), 0);
+    EXPECT_EQ(axis(centered, 8), 0);
+    EXPECT_EQ(axis(centered, 10), 0);
+    EXPECT_EQ(axis(centered, 12), 0);
+
+    // Sony Y grows downward; XUSB Y grows upward.
+    const auto low = encode(0, 0);
+    EXPECT_EQ(axis(low, 6), -32768);
+    EXPECT_EQ(axis(low, 8), 32767);
+    const auto high = encode(255, 255);
+    EXPECT_EQ(axis(high, 6), 32767);
+    EXPECT_EQ(axis(high, 8), -32768);
+}
+
 void xusb360_rumble_decodes_to_ds5_classic_rumble_payload() {
     uint8_t output[kXusb360RumbleOutputSize] = {0x00, kXusb360RumbleOutputSize, 0x00, 0x90, 0x30, 0, 0, 0};
     Payload payload{};
@@ -1361,8 +1498,7 @@ void ds4_persona_maps_standard_gamepad_fields() {
     EXPECT_EQ(encoded.bytes[6] & 0x03, 0x03); // PS + touchpad click.
     EXPECT_EQ(encoded.bytes[7], 0x22);
     EXPECT_EQ(encoded.bytes[8], 0xcc);
-    EXPECT_EQ(encoded.bytes[9], 0x44);
-    EXPECT_EQ(encoded.bytes[10], 0x33);
+    // Bytes 9-10 are the DS4 motion clock; see ds4_persona_motion_timestamp_uses_ds4_ticks.
     EXPECT_EQ(encoded.bytes[11], 0x09);
     EXPECT_EQ(encoded.bytes[12], 0x34);
     EXPECT_EQ(encoded.bytes[13], 0x12);
@@ -1387,6 +1523,58 @@ void ds4_persona_maps_standard_gamepad_fields() {
     EXPECT_EQ(encoded.bytes[39], 0x00);
     EXPECT_EQ(encoded.bytes[40], 0x00);
     EXPECT_EQ(encoded.bytes[41], 0x00);
+}
+
+uint16_t ds4_motion_timestamp_for(uint32_t sensor_timestamp, bool motion_valid = true) {
+    auto report = sample_dualsense_input_report();
+    report[27] = static_cast<uint8_t>(sensor_timestamp);
+    report[28] = static_cast<uint8_t>(sensor_timestamp >> 8);
+    report[29] = static_cast<uint8_t>(sensor_timestamp >> 16);
+    report[30] = static_cast<uint8_t>(sensor_timestamp >> 24);
+    BridgeControllerState state{};
+    HostPersonaInputReport encoded{};
+    EXPECT_TRUE(dualsense_decode_usb_input_report(report.data(), report.size(), state));
+    state.motion_valid = motion_valid;
+    EXPECT_TRUE(host_persona_encode_input(HostPersonaModeDs4, state, encoded));
+    return static_cast<uint16_t>(encoded.bytes[9] | (encoded.bytes[10] << 8));
+}
+
+// The DualSense motion clock ticks every 1/3 us and a DS4's every 16/3 us.
+// Copying the raw value ran DS4 time 16x fast and wrapped it every 21.8 ms.
+void ds4_persona_motion_timestamp_uses_ds4_ticks() {
+    ds4_motion_timestamp_for(0, false);
+    const uint16_t start = ds4_motion_timestamp_for(0x11223344u);
+
+    // 1 ms of DualSense ticks (3000) is 187.5 DS4 ticks; the half carries.
+    EXPECT_EQ(static_cast<uint16_t>(ds4_motion_timestamp_for(0x11223344u + 3000u) - start), 187);
+    EXPECT_EQ(static_cast<uint16_t>(ds4_motion_timestamp_for(0x11223344u + 6000u) - start), 375);
+
+    // Ten seconds of 4 ms reports stays exact, with no 16-bit truncation of
+    // the DualSense value.
+    uint32_t sensor = 0x11223344u + 6000u;
+    uint16_t last = static_cast<uint16_t>(start + 375);
+    for (int report = 0; report < 2500; ++report) {
+        sensor += 12000u;
+        const uint16_t now = ds4_motion_timestamp_for(sensor);
+        EXPECT_EQ(static_cast<uint16_t>(now - last), 750);
+        last = now;
+    }
+
+    // The DualSense clock wrapping its 32 bits is an ordinary step.
+    ds4_motion_timestamp_for(0xFFFFF000u, false);
+    const uint16_t wrap_start = ds4_motion_timestamp_for(0xFFFFF000u);
+    EXPECT_EQ(static_cast<uint16_t>(ds4_motion_timestamp_for(0x00000400u) - wrap_start), 0x1400 / 16);
+
+    // A gap longer than the 16-bit DS4 clock can show (~349.5 ms) resyncs
+    // instead of wrapping into a short step.
+    const uint16_t before_stall = ds4_motion_timestamp_for(0x20000000u);
+    EXPECT_EQ(ds4_motion_timestamp_for(0x20000000u + 1500000u), before_stall);
+    EXPECT_EQ(static_cast<uint16_t>(ds4_motion_timestamp_for(0x20000000u + 1500000u + 12000u) - before_stall), 750);
+
+    // A reconnected controller restarts its clock: resync without a jump.
+    const uint16_t before_restart = ds4_motion_timestamp_for(0x50000000u);
+    EXPECT_EQ(ds4_motion_timestamp_for(0x00000010u), before_restart);
+    EXPECT_EQ(static_cast<uint16_t>(ds4_motion_timestamp_for(0x00000010u + 1600u) - before_restart), 100);
 }
 
 void ds4_output_decodes_to_ds5_rumble_and_lightbar_payload() {
@@ -1553,6 +1741,44 @@ void ds4_feature_reports_cover_native_probe_surface() {
     EXPECT_EQ(feature[4], 0x00);
 }
 
+// Changes the personas' synthetic identity for the rest of the run, so it is
+// registered last.
+void synthetic_persona_identities_are_per_bridge_and_locally_administered() {
+    const auto ds4_address = [](uint8_t const *seed) {
+        ds4_persona_set_identity_seed(seed, 8);
+        std::array<uint8_t, 64> feature{};
+        EXPECT_EQ(ds4_persona_get_feature_report(0x12, feature.data(), 15), 15);
+        // Bytes 0-5 carry the address little-endian.
+        return std::array<uint8_t, 6>{feature[5], feature[4], feature[3], feature[2], feature[1], feature[0]};
+    };
+    const uint8_t first_board[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    const uint8_t second_board[8] = {1, 2, 3, 4, 5, 6, 7, 9};
+
+    const auto first = ds4_address(first_board);
+    const auto second = ds4_address(second_board);
+    EXPECT_EQ(first[0], 0x02);
+    EXPECT_EQ(second[0], 0x02);
+    EXPECT_TRUE(first != second);
+    EXPECT_TRUE(ds4_address(first_board) == first);
+
+    std::array<uint8_t, 64> identity{};
+    EXPECT_EQ(ds4_persona_get_feature_report(0x81, identity.data(), 63), 63);
+    char expected_serial[17]{};
+    std::snprintf(
+        expected_serial,
+        sizeof(expected_serial),
+        "1111%02X%02X%02X%02X%02X%02X",
+        first[0], first[1], first[2], first[3], first[4], first[5]
+    );
+    EXPECT_EQ(std::memcmp(identity.data() + 17, expected_serial, 16), 0);
+
+    dualsense_persona_set_identity_seed(first_board, sizeof(first_board));
+    std::array<uint8_t, 64> pairing{};
+    EXPECT_EQ(dualsense_persona_get_feature_report(HostPersonaModeDualSense, 0x09, pairing.data(), 19), 19);
+    EXPECT_EQ(pairing[5], 0x02);
+    EXPECT_TRUE(!(pairing[4] == first[1] && pairing[3] == first[2] && pairing[2] == first[3]));
+}
+
 void radial_deadzone_preserves_direction_and_rescales_remaining_travel() {
     using ds5::radial_deadzone::apply;
 
@@ -1597,11 +1823,11 @@ std::vector<TestCase> tests{
     {"usb host speaker gain does not attenuate native haptics", usb_host_speaker_gain_does_not_attenuate_native_haptics},
     {"classic rumble gain clamps rounds and touches motor payloads", classic_rumble_gain_clamps_rounds_and_touches_motor_payloads},
     {"dualsense edge profile switching payload sets owned mode byte", dualsense_edge_profile_switching_payload_sets_owned_mode_byte},
-    {"audio haptics replace tracks state without suppressing classic rumble", audio_haptics_replace_tracks_state_without_suppressing_classic_rumble},
+    {"audio haptics replace suppresses rumble only while producer is live", audio_haptics_replace_suppresses_rumble_only_while_producer_is_live},
     {"speaker sanitizer strips host amp flags and zeroes only controlled fields", speaker_sanitizer_strips_host_amp_flags_and_zeroes_only_controlled_fields},
     {"mic sanitizer removes mute led and only mic power save bit", mic_sanitizer_removes_mute_led_and_only_mic_power_save_bit},
     {"lightbar override removes host led claims without mutating color bytes", lightbar_override_removes_host_led_claims_without_mutating_color_bytes},
-    {"host led clear detection covers release player and lightbar paths", host_led_clear_detection_covers_release_player_and_lightbar_paths},
+    {"host lightbar clear detection covers release and blank lightbar only", host_lightbar_clear_detection_covers_release_and_blank_lightbar_only},
     {"output state audio snapshot routes to speaker and headphones safely", output_state_audio_snapshot_routes_to_speaker_and_headphones_safely},
     {"output state audio snapshot preserves adaptive trigger effects and motor power", output_state_audio_snapshot_preserves_adaptive_trigger_effects_and_motor_power},
     {"output state lightbar override is scaled and survives audio snapshot", output_state_lightbar_override_is_scaled_and_survives_audio_snapshot},
@@ -1609,6 +1835,7 @@ std::vector<TestCase> tests{
     {"output state player led disabled suppresses host indicator", output_state_player_led_disabled_suppresses_host_indicator},
     {"output state player led reenabled restores host indicator", output_state_player_led_reenabled_restores_host_indicator},
     {"output state player led release invalidates cached indicator", output_state_player_led_release_invalidates_cached_indicator},
+    {"output state player led falls back to player one until host sets it", output_state_player_led_falls_back_to_player_one_until_host_sets_it},
     {"output state preserves selector zero and ignores motor only rumble", output_state_preserves_selector_zero_and_ignores_motor_only_rumble},
     {"output state strip zero classic rumble only removes idle selector", output_state_strip_zero_classic_rumble_only_removes_idle_selector},
     {"output state clear classic rumble clears cached selector state", output_state_clear_classic_rumble_clears_cached_selector_state},
@@ -1624,15 +1851,19 @@ std::vector<TestCase> tests{
     {"bootsel gesture policy emits click double triple and hold", bootsel_gesture_policy_emits_click_double_triple_and_hold},
     {"dualsense persona preserves native report bytes", dualsense_persona_preserves_native_report_bytes},
     {"xusb360 persona maps standard gamepad fields", xusb360_persona_maps_standard_gamepad_fields},
+    {"xusb360 persona centers sticks and reaches both endpoints", xusb360_persona_centers_sticks_and_reaches_both_endpoints},
     {"xusb360 rumble decodes to ds5 classic rumble payload", xusb360_rumble_decodes_to_ds5_classic_rumble_payload},
     {"classic rumble renderer can emit v1 classic rumble", classic_rumble_renderer_can_emit_v1_classic_rumble},
     {"classic rumble renderer restores audio haptics on stop", classic_rumble_renderer_restores_audio_haptics_on_stop},
     {"host zero rumble stop only restores active audio haptics", host_zero_rumble_stop_only_restores_an_active_audio_haptics_session},
     {"ds4 persona maps standard gamepad fields", ds4_persona_maps_standard_gamepad_fields},
+    {"ds4 persona motion timestamp uses ds4 ticks", ds4_persona_motion_timestamp_uses_ds4_ticks},
     {"ds4 output decodes to ds5 rumble and lightbar payload", ds4_output_decodes_to_ds5_rumble_and_lightbar_payload},
     {"dualsense persona feature reports cover identity probe surface", dualsense_persona_feature_reports_cover_identity_probe_surface},
     {"ds4 feature reports cover native probe surface", ds4_feature_reports_cover_native_probe_surface},
     {"radial deadzone preserves direction and rescales remaining travel", radial_deadzone_preserves_direction_and_rescales_remaining_travel},
+    // Must stay last: it replaces the personas' default synthetic identity.
+    {"synthetic persona identities are per bridge and locally administered", synthetic_persona_identities_are_per_bridge_and_locally_administered},
 };
 
 } // namespace

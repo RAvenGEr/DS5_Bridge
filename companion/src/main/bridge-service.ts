@@ -33,6 +33,7 @@ import {
   parseFeedbackTraceReport,
   parseFirmwareLogReport,
   parseCompanionInputReport,
+  parseResetEvidenceReport,
   parseStatusReport,
   readReportProtocolVersion,
   SHORTCUT_EVENT,
@@ -68,19 +69,23 @@ import type {
   MuteKeyboardBehavior,
   PollingRateMode,
   ReportProtocolVersion,
+  ResetEvidencePayload,
   ShortcutEvent,
   StickInputPreviewPayload,
   TriggerTestMode,
   TriggerTestTarget
 } from '../shared/protocol';
 import type {
+  BootloaderConfirmationPresentation,
   BridgeDiagnostics,
   BridgeSnapshot,
   CompanionSettings,
   AudioHapticsSession,
   HostPersonaTransition,
   HidDeviceSummary,
+  UiLocalePreference,
   UiScalePercent,
+  UiTextScalePercent,
   UiThemePreset,
   WindowsDeviceCleanupResult,
   BridgeDeviceCensus
@@ -93,18 +98,41 @@ import {
   playBridgeSpeakerTestTone,
   getDefaultRenderEndpointStatus,
   setDefaultRenderBridgeEndpoint,
-  listBridges,
   setAudioHelperBridgeTarget,
   type BridgeCensus,
+  type BridgeCensusEntry,
   type DefaultRenderEndpointStatus,
   type SystemAudioHapticsConfig
 } from './audio-helper';
+import type { BootloaderAuthorizationStorePort } from './bootloader-authorization-store';
+import { BridgeCensusClient, type BridgeCensusPort } from './bridge-census-client';
+import { claimBridgeContainer, isBridgeOnlyPath, projectBridgeDevices, uniqueIdForCensusRow } from './bridge-order';
 import { CompanionDebugConfig } from './debug-config';
+import { PicoBootloaderAuthorizationCoordinator } from './pico-bootloader-authorization-coordinator';
 import { HidDiscoveryClient } from './hid-discovery-client';
-import { SettingsStore, normalizeUiScalePercent, normalizeUiThemePreset } from './settings-store';
+import {
+  SettingsStore,
+  normalizeUiLocalePreference,
+  normalizeUiScalePercent,
+  normalizeUiTextScalePercent,
+  normalizeUiThemePreset
+} from './settings-store';
 import { WinUsbCompanionTransport } from './winusb-companion-transport';
+import { WakeOnLanService, wakeOnLanAckError, type WakeOnLanBridgeSession } from './wake-on-lan-service';
+import { WindowsWakeOnLanTargets, type WakeOnLanTargetsPort } from './wake-on-lan-targets';
+import { WakeOnLanReadinessService } from './wake-on-lan-readiness';
+import { KeyboardInputHelper, type KeyboardInputPort } from './keyboard-input-helper';
+import type {
+  WakeOnLanConfigurationInput,
+  WakeOnLanMetadata,
+  WakeOnLanReadiness,
+  WakeOnLanTarget
+} from '../shared/wake-on-lan-types';
 
 const POLL_INTERVAL_MS = 500;
+// A queued Wake-on-LAN command is ACKed on the firmware's next main-loop pass;
+// saving waits for a flash sector erase and program.
+const WAKE_ON_LAN_ACK_TIMEOUT_MS = 1500;
 const SHORTCUT_POLL_INTERVAL_MS = 50;
 const SHORTCUT_POLL_ERROR_RETRY_MS = 250;
 const STICK_INPUT_PREVIEW_LEASE_MS = 1500;
@@ -112,16 +140,43 @@ const AUDIO_STATUS_READ_INTERVAL_MS = 500;
 const AUDIO_DEBUG_READ_INTERVAL_MS = 500;
 const TRIGGER_TRACE_READ_INTERVAL_MS = 250;
 const FEEDBACK_TRACE_READ_INTERVAL_MS = 250;
-const BRIDGE_CENSUS_INTERVAL_MS = 10000;
+// Kitsune Input's bridge registry interval. A census is a line from the
+// resident census helper, so the bridge list keeps up with hot-plugs and with
+// the bridge reattaching each time a controller connects or disconnects.
+const BRIDGE_CENSUS_INTERVAL_MS = 2000;
+// While censuses fall back to a helper process each, they keep 1.x's pace.
+const ONE_SHOT_BRIDGE_CENSUS_INTERVAL_MS = 10000;
+// The selected bridge leaves USB for a moment whenever it changes persona or a
+// controller connects, disconnects or is swapped. Until it has been gone this
+// long, the selection stays on it and no other bridge takes its place.
+const SELECTED_BRIDGE_REATTACH_GRACE_MS = 12000;
 const AUDIO_DEBUG_DIAGNOSTICS_ENABLED = CompanionDebugConfig.audioDebugDiagnosticsEnabled;
 const TRIGGER_TRACE_DIAGNOSTICS_ENABLED = CompanionDebugConfig.triggerTraceDiagnosticsEnabled;
 const FEEDBACK_TRACE_DIAGNOSTICS_ENABLED = CompanionDebugConfig.feedbackTraceDiagnosticsEnabled;
 const MIC_KEEPALIVE_ENABLED = CompanionDebugConfig.micKeepaliveEnabled;
 const SYSTEM_AUDIO_HAPTICS_RETRY_MS = 5000;
+const SYSTEM_AUDIO_HAPTICS_MAX_RETRY_MS = 30000;
+const SYSTEM_AUDIO_HAPTICS_STABLE_MS = 10000;
+const SYSTEM_AUDIO_HAPTICS_APP_CHECK_MS = 1000;
+// SET_LIGHTBAR_COLOR flags byte: save the color without replacing a game's.
+const LIGHTBAR_COLOR_REFRESH_FLAG = 0x01;
+const TEST_HAPTICS_ENDPOINT_WAIT_MS = 5000;
+const TEST_HAPTICS_ENDPOINT_RETRY_MS = 250;
+const TEST_HAPTICS_SWITCHING_MESSAGE =
+  'Haptics test could not start while switching controller modes. Wait for the controller to reconnect, then try again.';
+const TEST_HAPTICS_ENDPOINT_UNAVAILABLE_MESSAGE =
+  'The controller audio endpoint is unavailable. Close any games using the controller and try again.';
+const TEST_HAPTICS_ENDPOINT_DISABLED_MESSAGE =
+  'The controller audio device is disabled in Windows. Enable it under Sound settings > More sound settings, then try again.';
+const TEST_HAPTICS_FAILED_MESSAGE =
+  'Haptics test failed. Close any games using the controller and try again. If it still fails, reconnect the controller.';
 const SYSTEM_AUDIO_HAPTICS_BYPASS_RETRY_MS = 2000;
 const AUDIO_HAPTICS_SESSION_CACHE_MS = 2500;
 const LOW_BATTERY_PERCENT = 20;
-const BUNDLED_FIRMWARE_VERSION = '1.7.1';
+// The battery level arrives a moment after the controller connects; the
+// connect toast waits this long for it before going out without it.
+const CONNECT_TOAST_BATTERY_WAIT_MS = 3000;
+const BUNDLED_FIRMWARE_VERSION = '2.0.1';
 const MIN_SUPPORTED_FIRMWARE_VERSION = '1.6.1';
 const FIRMWARE_UPDATE_REQUIRED_MESSAGE = `Firmware ${MIN_SUPPORTED_FIRMWARE_VERSION} update required`;
 const AUDIO_DEBUG_LOG_LINE_LIMIT = 300;
@@ -182,12 +237,22 @@ type CommandOptions = {
   extraPayload?: ArrayLike<number>;
   allowAckTransportLoss?: boolean;
   allowProtocolMismatch?: boolean;
+  /**
+   * The firmware queues this command and ACKs it from its main loop, so the
+   * first ACK read can still hold the previous command's result. Re-read it
+   * until the sequence matches or this many milliseconds pass.
+   */
+  deferredAckTimeoutMs?: number;
 };
+
+const DEFERRED_ACK_POLL_MS = 5;
 
 type HostPersonaTransitionState = HostPersonaTransition & {
   settlingUntil: number | null;
   reconnectingUntil: number;
   completedAt: number | null;
+  /** The transport generation open when the switch began; the switch completes only on a later one. */
+  openGeneration: number;
 };
 
 type HostPersonaDefaultRenderRestore = {
@@ -734,47 +799,6 @@ function virtualKeyCodeFor(key: string): number | null {
   return VIRTUAL_KEY_CODES[normalized] ?? null;
 }
 
-async function sendVirtualKeySequence(codes: number[]): Promise<void> {
-  const normalized = codes
-    .map((code) => Math.max(0, Math.min(0xff, Math.round(code))))
-    .filter((code) => Number.isFinite(code) && code > 0);
-  if (normalized.length === 0) {
-    return;
-  }
-  const downCodes = normalized.join(',');
-  const upCodes = [...normalized].reverse().join(',');
-  const script = [
-    "$ErrorActionPreference = 'Stop'",
-    "Add-Type -Namespace DS5Bridge -Name KeyboardInput -MemberDefinition '[DllImport(\"user32.dll\")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);'",
-    `foreach ($vk in @(${downCodes})) { [DS5Bridge.KeyboardInput]::keybd_event([byte]$vk, 0, 0, [UIntPtr]::Zero) }`,
-    'Start-Sleep -Milliseconds 20',
-    `foreach ($vk in @(${upCodes})) { [DS5Bridge.KeyboardInput]::keybd_event([byte]$vk, 0, 2, [UIntPtr]::Zero) }`
-  ].join('; ');
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn('powershell.exe', [
-      '-NoProfile',
-      '-ExecutionPolicy',
-      'Bypass',
-      '-Command',
-      script
-    ], {
-      windowsHide: true
-    });
-    let stderr = '';
-    child.stderr?.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString('utf8');
-    });
-    child.on('error', reject);
-    child.on('exit', (code) => {
-      if (code === 0) {
-        resolve();
-      } else {
-        reject(new Error(`Shortcut key injection failed${stderr ? `: ${stderr.trim()}` : ''}`));
-      }
-    });
-  });
-}
-
 function formatUsbDebugEvent(prefix: string, args: number[]): string {
   const [type, arg1, arg2, arg3, arg4] = args;
   switch (type) {
@@ -802,6 +826,27 @@ function normalizeHostPersonaMode(mode: HostPersonaMode): HostPersonaMode {
     return mode;
   }
   return 'dualsense';
+}
+
+// The USB IDs each persona attaches with (usb_descriptors.c). Without a
+// controller the bridge attaches bridge-only (1209:DB08) in every persona.
+const HOST_PERSONA_USB_IDS: Record<HostPersonaMode, string> = {
+  dualsense: 'vid_054c&pid_0ce6',
+  'dualsense-edge': 'vid_054c&pid_0df2',
+  ds4: 'vid_054c&pid_09cc',
+  xbox: 'vid_1209&pid_db05'
+};
+
+/** True when the path is a persona's attachment other than `mode`'s. */
+function pathShowsOtherHostPersona(path: string | null, mode: HostPersonaMode): boolean {
+  const lowered = path?.toLowerCase() ?? '';
+  return Object.entries(HOST_PERSONA_USB_IDS)
+    .some(([persona, usbIds]) => persona !== mode && lowered.includes(usbIds));
+}
+
+/** "80%", or "80% (charging)" while the controller charges. */
+function controllerBatteryText(batteryPercent: number, rawPowerState: number): string {
+  return rawPowerState === 0x01 ? `${batteryPercent}% (charging)` : `${batteryPercent}%`;
 }
 
 function hostPersonaModeLabel(mode: HostPersonaMode): string {
@@ -1229,8 +1274,21 @@ async function runElevatedWindowsDeviceCleanup(scriptPath: string, logPath: stri
 
 export class BridgeService extends EventEmitter {
   private device: WinUsbCompanionTransport | null = null;
+  private readonly bridgeCensusSource: BridgeCensusPort = new BridgeCensusClient();
   private bridgeCensus: BridgeCensus | null = null;
   private lastBridgeCensusAt = 0;
+  /** Set when the transport opens; the first status read then checks the census lists its path. */
+  private openedDeviceCensusCheckPending = false;
+  /** A bridge opened to find out whether it is the selected one. */
+  private bridgeIdentityProbe: { path: string; expectedUniqueId: string } | null = null;
+  /** Paths a probe could not match to the selected bridge, until the census, the selection or a refresh changes. */
+  private readonly probedBridgePaths = new Set<string>();
+  /** The census's paths, to forget probe results when a bridge attaches or leaves. */
+  private bridgeCensusPathKey = '';
+  /** When a census last listed the selected bridge (0: not this run); it is away only briefly while it reattaches. */
+  private selectedBridgeSeenAt = 0;
+  /** Counts transport opens, so a persona switch knows the bridge came back after it. */
+  private deviceOpenGeneration = 0;
   private connectedBridgeUniqueId: string | null = null;
   private connectedControllerMac: string | null = null;
   private bindingAppliedForMac: string | null = null;
@@ -1284,6 +1342,14 @@ export class BridgeService extends EventEmitter {
   private incompatibleCompanionProtocolVersion: ReportProtocolVersion | null = null;
   private lastAudioStatsSignature: string | null = null;
   private systemAudioHapticsRetryAt = 0;
+  private systemAudioHapticsFailures = 0;
+  private systemAudioHapticsRunningSince: number | null = null;
+  private systemAudioHapticsWaitingForApp = false;
+  private systemAudioHapticsExitedAppProcessId: number | null = null;
+  private bootloaderConfirmation: BootloaderConfirmationPresentation | null = null;
+  private bootloaderConfirmationCancelled = false;
+  private hapticsTestInFlight: Promise<BridgeSnapshot> | null = null;
+  private hapticsTestActive = false;
   private systemAudioHapticsPassthroughActive = false;
   private commandQueue: Promise<unknown> = Promise.resolve();
   private lastAudioStatusReadAt = 0;
@@ -1297,8 +1363,11 @@ export class BridgeService extends EventEmitter {
   private lastDefaultRenderEndpointStatusAt = 0;
   private controllerPowerSavingActive: boolean | null = null;
   private previousControllerConnected: boolean | null = null;
+  /** Set while the connect toast waits for the first battery level. */
+  private connectToastDeadline: number | null = null;
   private lowBatteryToastActive = false;
   private shortcutFeaturePollRetryAt = 0;
+  private resetEvidence: ResetEvidencePayload | null = null;
   private shortcutActionQueue: Promise<void> = Promise.resolve();
   private readonly shortcutActionHandlers: Record<ShortcutEvent, () => Promise<void>> = {
     [SHORTCUT_EVENT.CONTROLLER_VOLUME_DOWN]: () => this.applyControllerVolumeShortcut(-10),
@@ -1308,8 +1377,26 @@ export class BridgeService extends EventEmitter {
     [SHORTCUT_EVENT.MIC_MUTE_OFF]: () => this.applyControllerMicMuteEvent(false)
   };
 
-  constructor(private readonly settingsStore: SettingsStore) {
+  private readonly wakeOnLan: WakeOnLanService;
+  private readonly wakeOnLanReadiness = new WakeOnLanReadinessService();
+  private readonly keyboardInput: KeyboardInputPort = new KeyboardInputHelper();
+
+  constructor(
+    private readonly settingsStore: SettingsStore,
+    private readonly bootloaderAuthorizationStore?: BootloaderAuthorizationStorePort,
+    wakeOnLanTargets: WakeOnLanTargetsPort = new WindowsWakeOnLanTargets()
+  ) {
     super();
+    this.wakeOnLan = new WakeOnLanService({
+      session: () => this.wakeOnLanSession(),
+      read: () => this.readWakeOnLanStatus(),
+      send: (operation, payload) => this.sendWakeOnLanCommand(operation, payload),
+      targets: wakeOnLanTargets,
+      now: () => Date.now(),
+      delay: (milliseconds) => new Promise<void>((resolve) => {
+        setTimeout(resolve, milliseconds);
+      })
+    });
     this.snapshot = {
       state: 'no-bridge',
       message: 'No bridge detected',
@@ -1378,7 +1465,6 @@ export class BridgeService extends EventEmitter {
     if (!device || now < this.shortcutFeaturePollRetryAt) {
       return;
     }
-
     try {
       const input = parseCompanionInputReport(
         await device.getFeatureReport(REPORT_ID.INPUT, REPORT_LENGTH)
@@ -1407,6 +1493,20 @@ export class BridgeService extends EventEmitter {
       // transfer failure does not leave controller shortcuts on the slow
       // status-poll path.
       this.shortcutFeaturePollRetryAt = Date.now() + SHORTCUT_POLL_ERROR_RETRY_MS;
+    }
+  }
+
+  private async readResetEvidence(): Promise<ResetEvidencePayload | null> {
+    if (!this.device) {
+      return null;
+    }
+    try {
+      return parseResetEvidenceReport(
+        await this.device.getFeatureReport(REPORT_ID.RESET_EVIDENCE, REPORT_LENGTH)
+      );
+    } catch {
+      // Supplementary, and absent from firmware before 2.0.
+      return null;
     }
   }
 
@@ -1447,6 +1547,11 @@ export class BridgeService extends EventEmitter {
       this.shortcutPollTimer = null;
     }
 
+    // A running Wake-on-LAN change stops at its next step; the firmware owns
+    // the radio teardown and drops unsaved staging on its own deadline.
+    this.wakeOnLan.stop();
+    this.keyboardInput.stop();
+    this.bridgeCensusSource.stop();
     await this.stopControllerAudioPolling();
     this.hidDiscovery.stop();
     this.closeDevice();
@@ -1457,7 +1562,8 @@ export class BridgeService extends EventEmitter {
       ...this.snapshot,
       stickInputPreview: this.stickInputPreviewLeaseUntil > Date.now()
         ? this.stickInputPreview
-        : null
+        : null,
+      bootloaderConfirmation: this.bootloaderConfirmation
     });
   }
 
@@ -1519,7 +1625,7 @@ export class BridgeService extends EventEmitter {
   }
 
   private async stopControllerAudioPolling(): Promise<void> {
-    this.systemAudioHapticsRetryAt = 0;
+    this.resetSystemAudioHapticsRecovery();
     this.systemAudioHapticsPassthroughActive = false;
     await this.systemAudioHapticsEngine.stop();
     await this.stopAudioHapticsSessionPolling();
@@ -1616,6 +1722,12 @@ export class BridgeService extends EventEmitter {
 
   private runShortcutPoll(): void {
     if (this.shortcutPollInFlight) {
+      return;
+    }
+    // Shortcut events and the stick preview come from the controller. With
+    // none connected, every 500 ms status poll already reads the report, so
+    // the 20 Hz timer would only repeat it.
+    if (this.snapshot.status && !this.snapshot.status.controllerConnected) {
       return;
     }
     this.shortcutPollInFlight = true;
@@ -1736,7 +1848,8 @@ export class BridgeService extends EventEmitter {
       deadlineAt: now + HOST_PERSONA_TRANSITION_TIMEOUT_MS,
       settlingUntil: null,
       reconnectingUntil: now + HOST_PERSONA_TRANSITION_TIMEOUT_MS + HOST_PERSONA_RECONNECT_GRACE_MS,
-      completedAt: null
+      completedAt: null,
+      openGeneration: this.deviceOpenGeneration
     };
   }
 
@@ -1865,7 +1978,15 @@ export class BridgeService extends EventEmitter {
     if (!transition) {
       return null;
     }
-    if (status.hostPersonaMode === transition.to) {
+    // The firmware reports the new persona as soon as it takes the command,
+    // then reattaches USB a moment later. Only a status read on a transport
+    // opened after the switch, on a path that is not another persona's,
+    // means the bridge is back as the new persona.
+    if (
+      status.hostPersonaMode === transition.to
+      && this.deviceOpenGeneration > transition.openGeneration
+      && !pathShowsOtherHostPersona(this.devicePath, transition.to)
+    ) {
       if (transition.settlingUntil === null) {
         transition.settlingUntil = now + HOST_PERSONA_TRANSITION_SETTLE_MS;
       }
@@ -1936,7 +2057,7 @@ export class BridgeService extends EventEmitter {
   }
 
   private async restartSystemAudioHapticsAfterPersonaTransition(mode: HostPersonaMode): Promise<void> {
-    this.systemAudioHapticsRetryAt = 0;
+    this.resetSystemAudioHapticsRecovery();
     await this.systemAudioHapticsEngine.stop();
     await this.updateSystemAudioHapticsEngine();
     this.appendAudioDebugLines([`[SystemHaptics] restarted after persona transition persona=${mode}`]);
@@ -1947,9 +2068,10 @@ export class BridgeService extends EventEmitter {
     return message.includes('Render endpoint matching') && message.includes('was not found');
   }
 
-  private skipBridgeHapticsTest(reason: string): BridgeSnapshot {
-    this.appendAudioDebugLines([`[HostBridge] test haptics skipped: ${reason}`]);
-    return this.getSnapshot();
+  /** The audio helper found the bridge's endpoint, but turned off in Windows Sound settings. */
+  private isBridgeEndpointDisabledError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return message.includes('is disabled in Windows Sound settings');
   }
 
   private async readAudioDebugEvents(): Promise<void> {
@@ -2571,18 +2693,17 @@ export class BridgeService extends EventEmitter {
 
   async setDuplexMicEnabled(enabled: boolean): Promise<BridgeSnapshot> {
     const nextEnabled = enabled;
-    if (!nextEnabled) {
-      await this.sendCommand(COMMAND_ID.SET_MIC_MUTE, 1, {
-        expectSettingsRevisionChange: true
-      });
-    }
-    await this.sendCommand(COMMAND_ID.SET_DUPLEX_ENABLED, nextEnabled ? 1 : 0, {
-      expectSettingsRevisionChange: true
-    });
+    // The controller lights its mute LED while the mic is enabled and muted.
+    // Unmute before enabling and disable before muting so a toggle never
+    // passes through that state and flashes the LED.
+    const options = { expectSettingsRevisionChange: true };
+    const sendMute = () => this.sendCommand(COMMAND_ID.SET_MIC_MUTE, nextEnabled ? 0 : 1, options);
     if (nextEnabled) {
-      await this.sendCommand(COMMAND_ID.SET_MIC_MUTE, 0, {
-        expectSettingsRevisionChange: true
-      });
+      await sendMute();
+    }
+    await this.sendCommand(COMMAND_ID.SET_DUPLEX_ENABLED, nextEnabled ? 1 : 0, options);
+    if (!nextEnabled) {
+      await sendMute();
     }
     this.snapshot.settings = this.settingsStore.update(customSettingUpdate({
       duplexMicEnabled: nextEnabled,
@@ -2646,7 +2767,7 @@ export class BridgeService extends EventEmitter {
   async setLightbarEnabled(enabled: boolean): Promise<BridgeSnapshot> {
     this.snapshot.settings = this.settingsStore.update(customSettingUpdate({ lightbarEnabled: enabled }));
     if (this.snapshot.state === 'connected') {
-      await this.applyLightbarSettings(this.snapshot.settings, true);
+      await this.applyLightbarSettings(this.snapshot.settings, true, false);
     }
     this.emitSnapshot();
     return this.getSnapshot();
@@ -2777,18 +2898,28 @@ export class BridgeService extends EventEmitter {
       case 'keyboard': {
         const codes = func.keys.map(virtualKeyCodeFor).filter((code): code is number => code !== null);
         if (codes.length !== func.keys.length || codes.length === 0) {
-          this.appendAudioDebugLines([`[Chords] ignored invalid keyboard function id=${func.id} keys=${func.keys.join('+')}`]);
+          this.appendAudioDebugLines([`[Chords] keyboard function id=${func.id} has unmapped keys: ${func.keys.join('+')}`]);
           return;
         }
-        await sendVirtualKeySequence(codes);
+        await this.typeChordKeys(func.id, codes);
         return;
       }
       case 'media':
-        await sendVirtualKeySequence([MEDIA_ACTION_KEY_CODES[func.action]]);
+        await this.typeChordKeys(func.id, [MEDIA_ACTION_KEY_CODES[func.action]]);
         return;
       case 'controller-setting':
         await this.executeChordControllerSettingAction(func.action, func.stepPercent);
         return;
+    }
+  }
+
+  /** Types through the resident keyboard helper; a key press that could not be sent is logged, never thrown. */
+  private async typeChordKeys(functionId: string, codes: number[]): Promise<void> {
+    try {
+      await this.keyboardInput.tap(codes);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.appendAudioDebugLines([`[Chords] function id=${functionId} not sent: ${message}`]);
     }
   }
 
@@ -2810,9 +2941,13 @@ export class BridgeService extends EventEmitter {
           return;
         }
         await this.setMicMute(!settings.micMuted);
+        this.emitMicMuteToast(this.settingsStore.get().micMuted);
         return;
       case 'sleep-controller':
         await this.sleepController();
+        return;
+      case 'show-battery':
+        this.emitBatteryLevelToast();
         return;
       case 'persona-dualsense':
         await this.setHostPersonaMode('dualsense');
@@ -2935,6 +3070,20 @@ export class BridgeService extends EventEmitter {
     }
   }
 
+  /** Asked for with a chord, so it shows whatever the notification settings say. */
+  private emitBatteryLevelToast(): void {
+    const status = this.snapshot.status;
+    if (!status?.controllerConnected) {
+      return;
+    }
+    this.emit('toast', {
+      title: 'DS5 Bridge',
+      body: status.batteryPercent === null
+        ? 'Controller battery level is not available yet'
+        : `Controller battery: ${controllerBatteryText(status.batteryPercent, status.rawPowerState)}`
+    } satisfies BridgeToast);
+  }
+
   private async applyControllerVolumeShortcut(deltaPercent: number): Promise<void> {
     const settings = this.settingsStore.get();
     if (!settings.speakerVolumeShortcutEnabled || !settings.speakerEnabled) {
@@ -2966,6 +3115,7 @@ export class BridgeService extends EventEmitter {
       this.snapshot.status.micMuted = micMuted;
     }
     this.emitSnapshot();
+    this.emitMicMuteToast(micMuted);
     void this.updateMicKeepaliveEngine(Boolean(this.snapshot.status?.controllerConnected));
   }
 
@@ -3038,6 +3188,22 @@ export class BridgeService extends EventEmitter {
     return this.getSnapshot();
   }
 
+  setUiTextScalePercent(value: UiTextScalePercent): BridgeSnapshot {
+    this.snapshot.settings = this.settingsStore.update({
+      uiTextScalePercent: normalizeUiTextScalePercent(value)
+    });
+    this.emitSnapshot();
+    return this.getSnapshot();
+  }
+
+  setUiLocale(value: UiLocalePreference): BridgeSnapshot {
+    this.snapshot.settings = this.settingsStore.update({
+      uiLocale: normalizeUiLocalePreference(value)
+    });
+    this.emitSnapshot();
+    return this.getSnapshot();
+  }
+
   setUiThemePreset(value: UiThemePreset): BridgeSnapshot {
     this.snapshot.settings = this.settingsStore.update({
       uiThemePreset: normalizeUiThemePreset(value)
@@ -3062,9 +3228,18 @@ export class BridgeService extends EventEmitter {
     return this.getSnapshot();
   }
 
-  setKitsuneInputPromotionDismissed(dismissed: boolean): BridgeSnapshot {
+  setCloseButtonQuits(enabled: boolean): BridgeSnapshot {
     this.snapshot.settings = this.settingsStore.update({
-      kitsuneInputPromotionDismissed: dismissed
+      closeButtonQuits: enabled
+    });
+    this.emitSnapshot();
+    return this.getSnapshot();
+  }
+
+  /** Records that the one-time Kitsune Input offer was shown; there is no way to clear it. */
+  markKitsuneInputLaunchOfferShown(): BridgeSnapshot {
+    this.snapshot.settings = this.settingsStore.update({
+      kitsuneInputLaunchOfferShown: true
     });
     this.emitSnapshot();
     return this.getSnapshot();
@@ -3104,11 +3279,111 @@ export class BridgeService extends EventEmitter {
     return this.getSnapshot();
   }
 
+  // UF2 mode from the app needs this computer's enrolled key and a face-button
+  // sequence entered on the controller; see the coordinator for the flow.
   async mountPicoBootloader(): Promise<void> {
-    await this.sendCommand(COMMAND_ID.ENTER_BOOTLOADER, 0, {
-      allowAckTransportLoss: true,
-      allowProtocolMismatch: true
+    this.bootloaderConfirmationCancelled = false;
+    const readFeatureReport = async (reportId: number, length: number): Promise<number[]> => {
+      await this.ensureCompanionDevice({ allowProtocolMismatch: true });
+      if (!this.device) {
+        throw new Error('No companion bridge is connected.');
+      }
+      return this.device.getFeatureReport(reportId, length);
+    };
+    const coordinator = new PicoBootloaderAuthorizationCoordinator({
+      store: this.bootloaderAuthorizationStore,
+      // Every firmware answers the ACK report, so its header gives the
+      // protocol even when the status report is incompatible.
+      firmwareProtocolVersion: async () => readReportProtocolVersion(
+        await readFeatureReport(REPORT_ID.ACK, REPORT_LENGTH),
+        REPORT_ID.ACK
+      ),
+      readFeatureReport: (reportId, length) => readFeatureReport(reportId, length),
+      sendCommand: (commandId, value, options = {}) => this.sendCommand(commandId, value, {
+        ...options,
+        allowProtocolMismatch: true
+      }),
+      showConfirmation: (presentation) => {
+        this.bootloaderConfirmation = presentation;
+        this.emitSnapshot();
+      },
+      hideConfirmation: () => {
+        this.bootloaderConfirmation = null;
+        this.emitSnapshot();
+      },
+      confirmationCancelled: () => this.bootloaderConfirmationCancelled,
+      delay: (milliseconds) => new Promise<void>((resolve) => {
+        setTimeout(resolve, milliseconds);
+      }),
+      now: () => Date.now()
     });
+    await coordinator.enter();
+  }
+
+  cancelBootloaderConfirmation(): BridgeSnapshot {
+    this.bootloaderConfirmationCancelled = true;
+    return this.getSnapshot();
+  }
+
+  getWakeOnLan(): Promise<WakeOnLanMetadata> {
+    return this.wakeOnLan.get();
+  }
+
+  getWakeOnLanTargets(refresh = false): Promise<WakeOnLanTarget[]> {
+    return this.wakeOnLan.listTargets(refresh);
+  }
+
+  /** Read-only Windows checks for the adapter being set up; never needs the bridge. */
+  getWakeOnLanReadiness(targetMac: unknown, refresh = false): Promise<WakeOnLanReadiness> {
+    return this.wakeOnLanReadiness.get(targetMac, refresh);
+  }
+
+  configureWakeOnLan(input: WakeOnLanConfigurationInput): Promise<WakeOnLanMetadata> {
+    return this.wakeOnLan.configure(input);
+  }
+
+  setWakeOnLanEnabled(enabled: boolean): Promise<WakeOnLanMetadata> {
+    return this.wakeOnLan.setEnabled(enabled);
+  }
+
+  forgetWakeOnLan(): Promise<WakeOnLanMetadata> {
+    return this.wakeOnLan.forget();
+  }
+
+  cancelWakeOnLan(): Promise<void> {
+    return this.wakeOnLan.cancel();
+  }
+
+  private wakeOnLanSession(): WakeOnLanBridgeSession | null {
+    const bridgeId = this.snapshot.diagnostics.deviceIdentity?.bridgeId;
+    if (!this.device || this.snapshot.state !== 'connected' || !bridgeId) {
+      return null;
+    }
+    return {
+      bridgeId,
+      protocolVersion: this.snapshot.diagnostics.protocolVersion,
+      controllerConnected: Boolean(this.snapshot.status?.controllerConnected)
+    };
+  }
+
+  private readWakeOnLanStatus(): Promise<number[]> {
+    return this.enqueueCommand(async () => {
+      if (!this.device) {
+        throw new Error('No companion bridge is connected.');
+      }
+      return this.device.getFeatureReport(REPORT_ID.WAKE_ON_LAN, REPORT_LENGTH);
+    });
+  }
+
+  private async sendWakeOnLanCommand(operation: number, payload: Uint8Array): Promise<void> {
+    const ack = await this.sendCommand(COMMAND_ID.WAKE_ON_LAN, operation, {
+      extraPayload: payload,
+      deferredAckTimeoutMs: WAKE_ON_LAN_ACK_TIMEOUT_MS,
+      throwOnCommandError: false
+    });
+    if (ack.resultCode !== ACK_RESULT.OK) {
+      throw wakeOnLanAckError(ack.resultCode);
+    }
   }
 
   async setNotifyControllerConnection(enabled: boolean): Promise<BridgeSnapshot> {
@@ -3124,6 +3399,29 @@ export class BridgeService extends EventEmitter {
     return this.getSnapshot();
   }
 
+  async setNotifyPersonaChange(enabled: boolean): Promise<BridgeSnapshot> {
+    this.snapshot.settings = this.settingsStore.update({ notifyPersonaChange: enabled });
+    this.emitSnapshot();
+    return this.getSnapshot();
+  }
+
+  async setNotifyMicMute(enabled: boolean): Promise<BridgeSnapshot> {
+    this.snapshot.settings = this.settingsStore.update({ notifyMicMute: enabled });
+    this.emitSnapshot();
+    return this.getSnapshot();
+  }
+
+  /** For a mute change made on the controller, by its button or a chord. */
+  private emitMicMuteToast(micMuted: boolean): void {
+    if (!this.settingsStore.get().notifyMicMute) {
+      return;
+    }
+    this.emit('toast', {
+      title: 'DS5 Bridge',
+      body: micMuted ? 'Controller mic muted' : 'Controller mic unmuted'
+    } satisfies BridgeToast);
+  }
+
   async testNotification(): Promise<BridgeSnapshot> {
     this.emit('toast', {
       title: 'DS5 Bridge',
@@ -3133,22 +3431,77 @@ export class BridgeService extends EventEmitter {
   }
 
   async testHaptics(): Promise<BridgeSnapshot> {
-    const transition = this.hostPersonaTransitionMaskSnapshot();
+    if (this.hapticsTestInFlight) {
+      return this.hapticsTestInFlight;
+    }
+    const test = this.runHapticsTest().finally(() => {
+      this.hapticsTestInFlight = null;
+    });
+    this.hapticsTestInFlight = test;
+    return test;
+  }
+
+  // Failures reject with guidance the app shows next to the test button.
+  private async runHapticsTest(): Promise<BridgeSnapshot> {
+    const transition = this.hostPersonaTransitionSnapshot();
     if (transition) {
-      return this.skipBridgeHapticsTest(`switching to ${transition.to}`);
+      this.appendAudioDebugLines([`[HostBridge] test haptics skipped: switching to ${transition.to}`]);
+      throw new Error(TEST_HAPTICS_SWITCHING_MESSAGE);
     }
 
     const settings = this.settingsStore.get();
     const hostPersonaMode = this.currentHostPersonaMode();
+    // System Audio Haptics writes the same bridge frames, so pause it while
+    // the pattern plays rather than interleave the two.
+    this.hapticsTestActive = true;
     try {
-      await playBridgeHapticsTestPattern(settings.hapticsGainPercent, hostPersonaMode);
+      await this.systemAudioHapticsEngine.stop();
+      await this.playHapticsTestWhenEndpointReady(settings.hapticsGainPercent, hostPersonaMode);
     } catch (error) {
-      if (this.isBridgeRenderEndpointUnavailableError(error)) {
-        return this.skipBridgeHapticsTest(`${hostPersonaModeLabel(hostPersonaMode)} audio endpoint unavailable`);
+      const message = error instanceof Error ? error.message : String(error);
+      this.appendAudioDebugLines([
+        `[HostBridge] test haptics failed persona=${hostPersonaMode} error=${message}`
+      ]);
+      throw new Error(
+        this.isBridgeEndpointDisabledError(error)
+          ? TEST_HAPTICS_ENDPOINT_DISABLED_MESSAGE
+          : this.isBridgeRenderEndpointUnavailableError(error)
+            ? TEST_HAPTICS_ENDPOINT_UNAVAILABLE_MESSAGE
+            : TEST_HAPTICS_FAILED_MESSAGE,
+        { cause: error }
+      );
+    } finally {
+      this.hapticsTestActive = false;
+      try {
+        await this.updateSystemAudioHapticsEngine();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.appendAudioDebugLines([`[SystemHaptics] resume after test haptics failed: ${message}`]);
       }
-      throw error;
     }
     return this.getSnapshot();
+  }
+
+  // Right after a persona switch the bridge's audio endpoint can appear a
+  // moment after its HID interface, so a missing endpoint gets a short wait.
+  private async playHapticsTestWhenEndpointReady(
+    gainPercent: number,
+    hostPersonaMode: HostPersonaMode
+  ): Promise<void> {
+    const deadline = Date.now() + TEST_HAPTICS_ENDPOINT_WAIT_MS;
+    for (;;) {
+      try {
+        await playBridgeHapticsTestPattern(gainPercent, hostPersonaMode);
+        return;
+      } catch (error) {
+        if (!this.isBridgeRenderEndpointUnavailableError(error) || Date.now() >= deadline) {
+          throw error;
+        }
+      }
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, TEST_HAPTICS_ENDPOINT_RETRY_MS);
+      });
+    }
   }
 
   async testSpeaker(): Promise<BridgeSnapshot> {
@@ -3191,7 +3544,7 @@ export class BridgeService extends EventEmitter {
           this.hostPersonaDefaultRenderRestore = null;
         }
         this.beginHostPersonaTransition(normalizedMode, previousMode);
-        this.systemAudioHapticsRetryAt = 0;
+        this.resetSystemAudioHapticsRecovery();
         void this.systemAudioHapticsEngine.stop().catch((error) => {
           const message = error instanceof Error ? error.message : String(error);
           this.appendAudioDebugLines([`[SystemHaptics] persona switch stop failed: ${message}`]);
@@ -3490,10 +3843,24 @@ export class BridgeService extends EventEmitter {
       }
       let ack: BridgeAckPayload;
       try {
-        const rawAckReport = await this.device.getFeatureReport(REPORT_ID.ACK, REPORT_LENGTH);
-        ack = options.allowProtocolMismatch
-          ? parseAckReport(rawAckReport, { allowProtocolMismatch: true })
-          : parseAckReport(rawAckReport);
+        const readAck = async () => {
+          const rawAckReport = await this.device!.getFeatureReport(REPORT_ID.ACK, REPORT_LENGTH);
+          return options.allowProtocolMismatch
+            ? parseAckReport(rawAckReport, { allowProtocolMismatch: true })
+            : parseAckReport(rawAckReport);
+        };
+        ack = await readAck();
+        if (options.deferredAckTimeoutMs !== undefined) {
+          const deadline = Date.now() + options.deferredAckTimeoutMs;
+          while (
+            (ack.commandId !== (commandId & 0xff) || ack.commandSequence !== sequence)
+            && Date.now() < deadline
+            && this.device
+          ) {
+            await new Promise<void>((resolve) => { setTimeout(resolve, DEFERRED_ACK_POLL_MS); });
+            ack = await readAck();
+          }
+        }
       } catch (error) {
         if (!options.allowAckTransportLoss || !isBridgeTransportError(error)) {
           throw error;
@@ -3532,6 +3899,11 @@ export class BridgeService extends EventEmitter {
   }
 
   private async updateSystemAudioHapticsEngine(): Promise<void> {
+    if (this.hapticsTestActive) {
+      // Test Haptics owns the bridge frames and resumes this when it ends.
+      await this.systemAudioHapticsEngine.stop();
+      return;
+    }
     const settings = this.settingsStore.get();
     if (
       !this.systemAudioHapticsDesired(settings)
@@ -3541,7 +3913,7 @@ export class BridgeService extends EventEmitter {
     ) {
       const wasPassthroughActive = this.systemAudioHapticsPassthroughActive;
       this.systemAudioHapticsPassthroughActive = false;
-      this.systemAudioHapticsRetryAt = 0;
+      this.resetSystemAudioHapticsRecovery();
       await this.systemAudioHapticsEngine.stop();
       if (wasPassthroughActive && this.device && this.audioReactiveHapticsSupported()) {
         await this.applyAudioReactiveHapticsSettings(settings, false);
@@ -3555,14 +3927,31 @@ export class BridgeService extends EventEmitter {
     }
 
     try {
+      const wasRunning = this.systemAudioHapticsEngine.isActive();
       await this.systemAudioHapticsEngine.start(this.systemAudioHapticsConfig(settings), this.currentHostPersonaMode());
       if (this.systemAudioHapticsPassthroughActive) {
         this.systemAudioHapticsPassthroughActive = false;
         await this.applyAudioReactiveHapticsSettings(settings, false);
       }
       this.systemAudioHapticsRetryAt = 0;
+      this.systemAudioHapticsWaitingForApp = false;
+      this.systemAudioHapticsExitedAppProcessId = null;
+      if (!wasRunning) {
+        this.systemAudioHapticsRunningSince = Date.now();
+      }
     } catch (error) {
       await this.systemAudioHapticsEngine.stop();
+      if ((error as { reason?: unknown } | null)?.reason === 'app-session-unavailable') {
+        // A closed game returns under a new process. Watch the session list for
+        // it every second rather than relaunching the helper on a backoff.
+        if (!this.systemAudioHapticsWaitingForApp) {
+          this.appendAudioDebugLines(['[SystemHaptics] waiting for the selected app to play audio']);
+        }
+        this.systemAudioHapticsWaitingForApp = true;
+        this.systemAudioHapticsRunningSince = null;
+        this.systemAudioHapticsRetryAt = Date.now() + SYSTEM_AUDIO_HAPTICS_APP_CHECK_MS;
+        return;
+      }
       if (this.systemAudioHapticsPassthroughActive) {
         this.systemAudioHapticsRetryAt = Date.now() + SYSTEM_AUDIO_HAPTICS_BYPASS_RETRY_MS;
         await this.applyAudioReactiveHapticsSettings(settings, false);
@@ -3571,12 +3960,83 @@ export class BridgeService extends EventEmitter {
         ]);
         return;
       }
-      this.systemAudioHapticsRetryAt = Date.now() + SYSTEM_AUDIO_HAPTICS_RETRY_MS;
+      const retryInMs = this.scheduleSystemAudioHapticsRetry();
       const message = error instanceof Error ? error.message : String(error);
       this.appendAudioDebugLines([
-        `[SystemHaptics] capture unavailable retryInMs=${SYSTEM_AUDIO_HAPTICS_RETRY_MS} error=${message}`
+        `[SystemHaptics] capture unavailable retryInMs=${retryInMs} error=${message}`
       ]);
     }
+  }
+
+  // A helper that starts and then exits shortly afterwards (for example a
+  // device that keeps failing) used to be relaunched on every status poll,
+  // recreating the Windows audio session and flashing the volume mixer.
+  // Back off exponentially up to 30 s; a stable run resets the backoff.
+  private scheduleSystemAudioHapticsRetry(): number {
+    this.systemAudioHapticsRunningSince = null;
+    const delay = Math.min(
+      SYSTEM_AUDIO_HAPTICS_MAX_RETRY_MS,
+      SYSTEM_AUDIO_HAPTICS_RETRY_MS * 2 ** Math.min(this.systemAudioHapticsFailures, 6)
+    );
+    this.systemAudioHapticsFailures += 1;
+    this.systemAudioHapticsRetryAt = Date.now() + delay;
+    return delay;
+  }
+
+  private noteSystemAudioHapticsHelperExited(): void {
+    const runningSince = this.systemAudioHapticsRunningSince;
+    this.systemAudioHapticsRunningSince = null;
+    if (runningSince === null) {
+      // The helper never finished starting; the failed start already backed off.
+      return;
+    }
+    if (Date.now() - runningSince >= SYSTEM_AUDIO_HAPTICS_STABLE_MS) {
+      this.systemAudioHapticsFailures = 0;
+      return;
+    }
+    const retryInMs = this.scheduleSystemAudioHapticsRetry();
+    this.appendAudioDebugLines([
+      `[SystemHaptics] helper exited soon after starting retryInMs=${retryInMs}`
+    ]);
+  }
+
+  // Route, persona, settings and connection changes start a fresh recovery.
+  private resetSystemAudioHapticsRecovery(): void {
+    this.systemAudioHapticsRetryAt = 0;
+    this.systemAudioHapticsFailures = 0;
+    this.systemAudioHapticsRunningSince = null;
+    this.systemAudioHapticsWaitingForApp = false;
+    this.systemAudioHapticsExitedAppProcessId = null;
+  }
+
+  // Matches the way the helper resolves the app: a saved path is
+  // authoritative, then the executable name, then the saved process id. The
+  // process that just exited may linger in the list and never counts.
+  private async selectedAudioHapticsAppAvailable(): Promise<boolean> {
+    const source = this.settingsStore.get().audioReactiveHapticsSource;
+    if (typeof source !== 'object' || source === null || source.kind !== 'app-session') {
+      return true;
+    }
+    const normalize = (value: string | null | undefined) => value?.trim().toLowerCase() || null;
+    const path = normalize(source.processPath);
+    const executable = normalize(source.executableName);
+    const sessions = await this.listAudioHapticsSessions();
+    return sessions.some((session) => {
+      if (
+        session.processId <= 0
+        || session.state === 'expired'
+        || session.processId === this.systemAudioHapticsExitedAppProcessId
+      ) {
+        return false;
+      }
+      if (path) {
+        return normalize(session.processPath) === path;
+      }
+      if (executable) {
+        return normalize(session.executableName) === executable;
+      }
+      return session.processId === source.processId;
+    });
   }
 
   private async handleSystemAudioHapticsStatus(line: string): Promise<void> {
@@ -3586,11 +4046,19 @@ export class BridgeService extends EventEmitter {
 
     try {
       const settings = this.settingsStore.get();
+      if (line.startsWith('system audio haptics helper exited')) {
+        this.noteSystemAudioHapticsHelperExited();
+        return;
+      }
       if (
         line.includes('route-changed')
         && this.systemAudioHapticsDesired(settings)
       ) {
-        this.systemAudioHapticsRetryAt = 0;
+        this.resetSystemAudioHapticsRecovery();
+        const exitedApp = /reason=app-session-exited processId=(\d+)/.exec(line);
+        if (exitedApp) {
+          this.systemAudioHapticsExitedAppProcessId = Number(exitedApp[1]);
+        }
         await this.systemAudioHapticsEngine.stop();
         await this.updateSystemAudioHapticsEngine();
         return;
@@ -3649,17 +4117,27 @@ export class BridgeService extends EventEmitter {
     }
   }
 
-  private async pulseSystemAudioHaptics(): Promise<void> {
-    const settings = this.settingsStore.get();
-    if (!this.systemAudioHapticsDesired(settings)) {
-      await this.updateSystemAudioHapticsEngine();
+  // Relaunches a helper that exited or failed to start once its backoff has
+  // elapsed. Settings reapply starts it for a new connection, and a persona
+  // switch in progress restarts it when the switch completes.
+  private async recoverSystemAudioHapticsIfDue(): Promise<void> {
+    if (
+      this.systemAudioHapticsEngine.isActive()
+      || this.reapplyActive
+      || this.reappliedSessionKey === null
+      || this.reappliedSessionKey !== this.sessionKey
+      || Date.now() < this.systemAudioHapticsRetryAt
+      || (this.hostPersonaTransition !== null && this.hostPersonaTransition.completedAt === null)
+      || !this.device
+      || !this.controllerAudioReady()
+      || !this.systemAudioHapticsDesired(this.settingsStore.get())
+    ) {
       return;
     }
-    if (!this.controllerAudioReady() || this.reapplyActive) {
-      await this.updateSystemAudioHapticsEngine();
+    if (this.systemAudioHapticsWaitingForApp && !await this.selectedAudioHapticsAppAvailable()) {
+      this.systemAudioHapticsRetryAt = Date.now() + SYSTEM_AUDIO_HAPTICS_APP_CHECK_MS;
       return;
     }
-    await this.ensureCompanionDevice();
     await this.updateSystemAudioHapticsEngine();
   }
 
@@ -3696,10 +4174,20 @@ export class BridgeService extends EventEmitter {
     }
     if (!status) {
       this.closeDevice();
-      const normalFirmwarePresent = rawDevices.some(isDualSenseDevice);
-      this.markBridgeUnavailableAfterDisconnect(rawDevices, normalFirmwarePresent);
+      this.markBridgeUnavailableAfterDisconnect(rawDevices, this.normalFirmwarePresent(rawDevices));
       this.emitSnapshot();
       return;
+    }
+    if (!await this.verifyBridgeIdentityProbe(rawDevices)) {
+      return;
+    }
+    if (this.openedDeviceCensusCheckPending) {
+      this.openedDeviceCensusCheckPending = false;
+      // A bridge that just attached, or came back on a new path, is listed
+      // with its name and rank as it connects, not at the next census.
+      if (this.devicePath && !this.bridgeCensusHasPath(this.devicePath)) {
+        await this.refreshBridgeCensus();
+      }
     }
 
     if (!isSupportedFirmwareVersion(status.firmwareVersion)) {
@@ -3728,6 +4216,12 @@ export class BridgeService extends EventEmitter {
 
     const transition = this.advanceHostPersonaTransition(status, now);
     const completedHostPersonaMode = this.consumeCompletedHostPersonaMode();
+    if (completedHostPersonaMode && this.settingsStore.get().notifyPersonaChange) {
+      this.emit('toast', {
+        title: 'DS5 Bridge',
+        body: `Switched to ${hostPersonaModeLabel(completedHostPersonaMode)} mode`
+      } satisfies BridgeToast);
+    }
     const controllerAudioReady = this.controllerAudioReady(status);
 
     if (!controllerAudioReady) {
@@ -3752,6 +4246,8 @@ export class BridgeService extends EventEmitter {
       this.sessionKey = `${this.devicePath ?? 'unknown'}:${Date.now()}`;
       this.sessionPath = this.devicePath;
       this.resetStartupReapplyState();
+      // Captured once per bridge boot, so read it once per session.
+      this.resetEvidence = await this.readResetEvidence();
     }
     this.lastUptimeSeconds = status.uptimeSeconds;
 
@@ -3783,7 +4279,8 @@ export class BridgeService extends EventEmitter {
         firmwareUpdateAvailable: firmwareUpdateAvailable(status.firmwareVersion),
         lastPollAt: Date.now(),
         rawDevices,
-        deviceIdentity
+        deviceIdentity,
+        resetEvidence: this.resetEvidence
       }),
       personaTransition: transition
     };
@@ -3794,6 +4291,8 @@ export class BridgeService extends EventEmitter {
     await this.restoreHostPersonaDefaultRenderIfReady(status);
     if (completedHostPersonaMode) {
       await this.restartSystemAudioHapticsAfterPersonaTransition(completedHostPersonaMode);
+    } else {
+      await this.recoverSystemAudioHapticsIfDue();
     }
     await this.updateMicKeepaliveEngine(status.controllerConnected);
     await this.syncControllerPowerSavingState(settings);
@@ -3851,16 +4350,32 @@ export class BridgeService extends EventEmitter {
   private async openAndReadStatus() {
     try {
       if (!this.device) {
+        const transitionActive = this.isHostPersonaTransitionActive();
+        if (
+          transitionActive
+          && this.bridgeCensusSource.isResident()
+          && Date.now() - this.lastBridgeCensusAt >= HOST_PERSONA_TRANSITION_OPEN_RETRY_MS
+        ) {
+          // The bridge is reattaching as its new persona; look for its new path
+          // now, as Kitsune Input does, not at the next scheduled census.
+          await this.refreshBridgeCensus();
+        }
+        const devicePath = this.preferredBridgePathForOpen();
+        if (devicePath === null) {
+          return null;
+        }
         this.device = await WinUsbCompanionTransport.open({
-          retryTimeoutMs: this.isHostPersonaTransitionActive() ? HOST_PERSONA_TRANSITION_OPEN_RETRY_MS : 0,
-          devicePath: this.preferredBridgePathForOpen()
+          retryTimeoutMs: transitionActive ? HOST_PERSONA_TRANSITION_OPEN_RETRY_MS : 0,
+          devicePath
         });
+        this.deviceOpenGeneration += 1;
         const openedDevice = this.device;
         this.device.on('error', (error: Error) => this.publishError(error));
         this.device.on('close', () => {
           void this.handleCompanionTransportClose(openedDevice);
         });
         this.devicePath = this.device.path;
+        this.openedDeviceCensusCheckPending = true;
         this.syncAudioHelperBridgeTarget();
         this.shortcutFeaturePollRetryAt = 0;
         this.lastUptimeSeconds = null;
@@ -3900,26 +4415,50 @@ export class BridgeService extends EventEmitter {
     } catch (error) {
       this.publishError(error);
     }
-    const normalFirmwarePresent = rawDevices.some(isDualSenseDevice);
-    this.markBridgeUnavailableAfterDisconnect(rawDevices, normalFirmwarePresent);
+    this.markBridgeUnavailableAfterDisconnect(rawDevices, this.normalFirmwarePresent(rawDevices));
     this.emitSnapshot();
   }
 
   private maybeEmitStatusToasts(status: BridgeStatusPayload): void {
     const settings = this.settingsStore.get();
     const controllerConnected = status.controllerConnected;
+    // The bridge keeps the last controller report across a disconnect, so the
+    // poll that first sees a reconnect can still carry the old battery level.
+    let connectedThisPoll = false;
 
     if (
       settings.notifyControllerConnection
       && this.previousControllerConnected !== null
       && this.previousControllerConnected !== controllerConnected
     ) {
-      this.emit('toast', {
-        title: 'DS5 Bridge',
-        body: controllerConnected ? 'Controller connected' : 'Controller disconnected'
-      } satisfies BridgeToast);
+      if (controllerConnected) {
+        this.connectToastDeadline = Date.now() + CONNECT_TOAST_BATTERY_WAIT_MS;
+        connectedThisPoll = true;
+      } else {
+        this.connectToastDeadline = null;
+        this.emit('toast', {
+          title: 'DS5 Bridge',
+          body: 'Controller disconnected'
+        } satisfies BridgeToast);
+      }
     }
     this.previousControllerConnected = controllerConnected;
+
+    if (
+      this.connectToastDeadline !== null
+      && !connectedThisPoll
+      && (status.batteryPercent !== null || Date.now() >= this.connectToastDeadline)
+    ) {
+      this.connectToastDeadline = null;
+      if (settings.notifyControllerConnection && controllerConnected) {
+        this.emit('toast', {
+          title: 'DS5 Bridge',
+          body: status.batteryPercent === null
+            ? 'Controller connected'
+            : `Controller connected — battery ${controllerBatteryText(status.batteryPercent, status.rawPowerState)}`
+        } satisfies BridgeToast);
+      }
+    }
 
     const lowBattery = controllerConnected
       && status.batteryPercent !== null
@@ -3942,6 +4481,7 @@ export class BridgeService extends EventEmitter {
       } satisfies BridgeToast);
     }
     this.previousControllerConnected = false;
+    this.connectToastDeadline = null;
     this.lowBatteryToastActive = false;
   }
 
@@ -4126,14 +4666,21 @@ export class BridgeService extends EventEmitter {
     );
   }
 
-  private async applyLightbarSettings(settings: CompanionSettings, expectSettingsRevisionChange: boolean): Promise<void> {
+  // A refresh (reconnect reapply, power-saving change) must not replace a
+  // color a game is showing, so firmware only saves it while a game owns the
+  // lightbar. An explicit change from the app always shows at once.
+  private async applyLightbarSettings(
+    settings: CompanionSettings,
+    expectSettingsRevisionChange: boolean,
+    refresh = true
+  ): Promise<void> {
     const color = settings.lightbarEnabled ? parseHexColor(settings.lightbarColor) : { red: 0, green: 0, blue: 0 };
     await this.sendCommand(
       COMMAND_ID.SET_LIGHTBAR_COLOR,
       this.effectiveLightbarBrightness(settings),
       {
         expectSettingsRevisionChange,
-        extraPayload: [color.red, color.green, color.blue]
+        extraPayload: [color.red, color.green, color.blue, refresh ? LIGHTBAR_COLOR_REFRESH_FLAG : 0]
       }
     );
     await this.sendCommand(COMMAND_ID.SET_LIGHTBAR_OVERRIDE, (!settings.lightbarEnabled || settings.lightbarOverrideEnabled) ? 1 : 0, {
@@ -4149,15 +4696,23 @@ export class BridgeService extends EventEmitter {
   }
 
   private async applyMicSettings(settings: CompanionSettings, expectSettingsRevisionChange: boolean): Promise<void> {
-    await this.sendCommand(COMMAND_ID.SET_DUPLEX_ENABLED, settings.duplexMicEnabled ? 1 : 0, {
-      expectSettingsRevisionChange
-    });
-    await this.sendCommand(COMMAND_ID.SET_MIC_VOLUME, settings.micVolumePercent, {
-      expectSettingsRevisionChange
-    });
-    await this.sendCommand(COMMAND_ID.SET_MIC_MUTE, settings.micMuted ? 1 : 0, {
-      expectSettingsRevisionChange
-    });
+    const options = { expectSettingsRevisionChange };
+    const sendEnabled = () => this.sendCommand(
+      COMMAND_ID.SET_DUPLEX_ENABLED,
+      settings.duplexMicEnabled ? 1 : 0,
+      options
+    );
+    // An enabled, muted mic lights the controller's mute LED. Disable before
+    // muting and set the mute state before enabling so a reapply that changes
+    // Mic Enabled does not flash the LED.
+    if (!settings.duplexMicEnabled) {
+      await sendEnabled();
+    }
+    await this.sendCommand(COMMAND_ID.SET_MIC_VOLUME, settings.micVolumePercent, options);
+    await this.sendCommand(COMMAND_ID.SET_MIC_MUTE, settings.micMuted ? 1 : 0, options);
+    if (settings.duplexMicEnabled) {
+      await sendEnabled();
+    }
   }
 
   private async setFirmwareSpeakerVolume(percent: number, expectSettingsRevisionChange: boolean): Promise<void> {
@@ -4202,12 +4757,11 @@ export class BridgeService extends EventEmitter {
     return Boolean(a && b && a.toLowerCase() === b.toLowerCase());
   }
 
-  private static isBridgeOnlyPath(path: string | null | undefined): boolean {
-    return Boolean(path && /vid_1209.*pid_db08/i.test(path));
-  }
-
   private async refreshBridgeCensusIfDue(): Promise<void> {
-    if (Date.now() - this.lastBridgeCensusAt >= BRIDGE_CENSUS_INTERVAL_MS) {
+    const intervalMs = this.bridgeCensusSource.isResident()
+      ? BRIDGE_CENSUS_INTERVAL_MS
+      : ONE_SHOT_BRIDGE_CENSUS_INTERVAL_MS;
+    if (Date.now() - this.lastBridgeCensusAt >= intervalMs) {
       await this.refreshBridgeCensus();
     }
   }
@@ -4215,20 +4769,15 @@ export class BridgeService extends EventEmitter {
   private async refreshBridgeCensus(): Promise<void> {
     this.lastBridgeCensusAt = Date.now();
     try {
-      this.bridgeCensus = await listBridges();
-      const selectedPath = this.settingsStore.get().selectedBridgePath;
-      if (
-        selectedPath
-        && this.bridgeCensus.bridges.length === 1
-        && !BridgeService.isBridgeOnlyPath(this.bridgeCensus.bridges[0].path)
-        && !this.bridgeCensus.bridges.some((bridge) => (
-          BridgeService.bridgePathsEqual(bridge.path, selectedPath)
-        ))
-      ) {
-        this.snapshot.settings = this.settingsStore.update({
-          selectedBridgePath: this.bridgeCensus.bridges[0].path
-        });
+      this.bridgeCensus = await this.bridgeCensusSource.list();
+      // A bridge that attaches or leaves can change what an unnamed path is,
+      // so earlier probe results no longer hold.
+      const pathKey = this.bridgeCensus.bridges.map((bridge) => bridge.path.toLowerCase()).sort().join('\n');
+      if (pathKey !== this.bridgeCensusPathKey) {
+        this.bridgeCensusPathKey = pathKey;
+        this.probedBridgePaths.clear();
       }
+      this.followSelectedBridge();
     } catch {
       // Enumeration is supplementary; retain the last successful census.
     }
@@ -4236,24 +4785,191 @@ export class BridgeService extends EventEmitter {
     this.syncAudioHelperBridgeTarget();
   }
 
+  private bridgeCensusHasPath(path: string): boolean {
+    return Boolean(this.bridgeCensus?.bridges.some((bridge) => BridgeService.bridgePathsEqual(bridge.path, path)));
+  }
+
+  /**
+   * Keeps the selection on its bridge, by ID, when the bridge comes back on a
+   * new path, as Kitsune Input's bridge registry does. A bridge-only path is
+   * not saved for it, since the bridge moves again when a controller
+   * connects; the transport still opens it.
+   *
+   * The bridge leaves USB for a moment whenever it changes persona or a
+   * controller connects, disconnects or is swapped, and may come back on a
+   * path no identity records yet. So the selection stays on it through a mode
+   * switch and for SELECTED_BRIDGE_REATTACH_GRACE_MS after it was last listed,
+   * and while any unnamed bridge has not been checked (see
+   * verifyBridgeIdentityProbe). Only then, if one other known bridge is left,
+   * is that bridge selected with its own workspace.
+   */
+  private followSelectedBridge(): void {
+    const settings = this.settingsStore.get();
+    const selectedPath = settings.selectedBridgePath;
+    if (!selectedPath) {
+      return;
+    }
+    const moved = this.selectedIdentityBridge(settings);
+    if (moved) {
+      this.selectedBridgeSeenAt = Date.now();
+      if (!isBridgeOnlyPath(moved.path) && !BridgeService.bridgePathsEqual(moved.path, selectedPath)) {
+        this.snapshot.settings = this.settingsStore.update({ selectedBridgePath: moved.path });
+      }
+      return;
+    }
+    if (this.selectedPathStillNamesSelectedBridge(settings)) {
+      this.selectedBridgeSeenAt = Date.now();
+      return;
+    }
+    if (
+      this.isHostPersonaTransitionActive()
+      || Date.now() - this.selectedBridgeSeenAt < SELECTED_BRIDGE_REATTACH_GRACE_MS
+      // Probes look for a known ID; without one there is nothing to wait for.
+      || (settings.selectedBridgeUniqueId && this.uncheckedUnnamedBridge(settings))
+    ) {
+      return;
+    }
+    const onlyBridge = this.bridgeCensus?.bridges.length === 1 ? this.bridgeCensus.bridges[0] : null;
+    if (!onlyBridge) {
+      return;
+    }
+    const onlyUniqueId = this.uniqueIdForCensusBridge(onlyBridge, settings);
+    if (onlyUniqueId) {
+      this.snapshot.settings = this.settingsStore.update({
+        selectedBridgePath: onlyBridge.path,
+        selectedBridgeUniqueId: onlyUniqueId
+      });
+    } else if (!settings.selectedBridgeUniqueId && !isBridgeOnlyPath(onlyBridge.path)) {
+      // Nothing says which bridge was selected; most likely this one, on a new path.
+      this.snapshot.settings = this.settingsStore.update({ selectedBridgePath: onlyBridge.path });
+    }
+  }
+
+  /** The saved path is listed and nothing names another bridge on it. */
+  private selectedPathStillNamesSelectedBridge(settings: CompanionSettings): boolean {
+    const selectedPath = settings.selectedBridgePath;
+    const row = selectedPath
+      ? this.bridgeCensus?.bridges.find((bridge) => BridgeService.bridgePathsEqual(bridge.path, selectedPath))
+      : undefined;
+    if (!row) {
+      return false;
+    }
+    const rowUniqueId = this.uniqueIdForCensusBridge(row, settings);
+    return !rowUniqueId || !settings.selectedBridgeUniqueId || rowUniqueId === settings.selectedBridgeUniqueId;
+  }
+
+  /** Listed bridges no identity names and no probe has checked: any may be the selected one on a new path. */
+  private uncheckedUnnamedBridges(settings: CompanionSettings): BridgeCensusEntry[] {
+    return this.bridgeCensus?.bridges.filter((bridge) => (
+      !this.uniqueIdForCensusBridge(bridge, settings)
+      && !this.probedBridgePaths.has(bridge.path.toLowerCase())
+    )) ?? [];
+  }
+
+  private uncheckedUnnamedBridge(settings: CompanionSettings): boolean {
+    return this.uncheckedUnnamedBridges(settings).length > 0;
+  }
+
+  /** Where the selected bridge's identity appears in the census, preferring the connected path. */
+  private selectedIdentityBridge(settings: CompanionSettings): BridgeCensusEntry | null {
+    const uniqueId = settings.selectedBridgeUniqueId;
+    if (!uniqueId) {
+      return null;
+    }
+    const candidates = this.bridgeCensus?.bridges.filter((bridge) => (
+      this.uniqueIdForCensusBridge(bridge, settings) === uniqueId
+    )) ?? [];
+    return candidates.find((bridge) => BridgeService.bridgePathsEqual(bridge.path, this.device?.path ?? null))
+      ?? candidates[0]
+      ?? null;
+  }
+
   private activeBridgePath(): string | null {
     return this.device?.path ?? this.settingsStore.get().selectedBridgePath ?? null;
   }
 
-  private preferredBridgePathForOpen(): string | undefined {
-    const selectedPath = this.settingsStore.get().selectedBridgePath;
-    if (
-      selectedPath
-      && this.bridgeCensus?.bridges.some((bridge) => (
-        BridgeService.bridgePathsEqual(bridge.path, selectedPath)
-      ))
-    ) {
-      return selectedPath;
+  /**
+   * The path to open: the selected bridge's, found by its ID wherever the
+   * census now lists it. A persona or controller the bridge has not had
+   * before attaches it on a container no identity records, so when no listed
+   * path carries the selected ID, each bridge the census cannot name is
+   * opened in turn to read its ID, as Kitsune Input's remount identity probe
+   * does, the saved path first. Null when the selected bridge is not plugged
+   * in: a path the census no longer lists is not retried, and no other bridge
+   * is opened in its place. Without a census (or with an empty one) the saved
+   * path is tried as before.
+   */
+  private preferredBridgePathForOpen(): string | null | undefined {
+    this.bridgeIdentityProbe = null;
+    const settings = this.settingsStore.get();
+    const selectedPath = settings.selectedBridgePath;
+    const selectedUniqueId = settings.selectedBridgeUniqueId;
+    const bridges = this.bridgeCensus?.bridges ?? [];
+    if (bridges.length === 0 || (!selectedPath && !selectedUniqueId)) {
+      return selectedPath ?? undefined;
     }
-    if (this.bridgeCensus?.bridges.length === 1) {
-      return this.bridgeCensus.bridges[0].path;
+    // While a persona switch is in flight, a path with another persona's USB
+    // IDs is the attachment the bridge is leaving; opening it again only
+    // holds a handle Windows waits on.
+    const switchingTo = this.hostPersonaTransition && this.hostPersonaTransition.completedAt === null
+      ? this.hostPersonaTransition.to
+      : null;
+    const leaving = (path: string) => switchingTo !== null && pathShowsOtherHostPersona(path, switchingTo);
+    const moved = this.selectedIdentityBridge(settings);
+    if (moved) {
+      return leaving(moved.path) ? null : moved.path;
     }
-    return selectedPath ?? undefined;
+    if (!selectedUniqueId) {
+      if (selectedPath && this.bridgeCensusHasPath(selectedPath)) {
+        return selectedPath;
+      }
+      return bridges.length === 1 ? bridges[0].path : null;
+    }
+    const candidates = this.uncheckedUnnamedBridges(settings).filter((bridge) => !leaving(bridge.path));
+    const candidate = candidates.find((bridge) => BridgeService.bridgePathsEqual(bridge.path, selectedPath))
+      ?? candidates[0];
+    if (!candidate) {
+      return null;
+    }
+    this.bridgeIdentityProbe = { path: candidate.path, expectedUniqueId: selectedUniqueId };
+    return candidate.path;
+  }
+
+  /**
+   * Checks that a bridge opened to look for the selected one is it, before
+   * anything else is read from or sent to it. When it is, its path becomes the
+   * selection's (unless bridge-only). Another bridge is recorded under its own
+   * ID, so the list names it, and closed. The selection only moves to it once
+   * the selected bridge has stayed away; see followSelectedBridge.
+   */
+  private async verifyBridgeIdentityProbe(rawDevices: HidDeviceSummary[]): Promise<boolean> {
+    const probe = this.bridgeIdentityProbe;
+    this.bridgeIdentityProbe = null;
+    const devicePath = this.device?.path ?? null;
+    if (!probe || !devicePath || !BridgeService.bridgePathsEqual(probe.path, devicePath)) {
+      return true;
+    }
+    const reportedUniqueId = (await this.readDeviceIdentity())?.bridgeId?.toLowerCase() ?? null;
+    if (reportedUniqueId === probe.expectedUniqueId) {
+      this.selectedBridgeSeenAt = Date.now();
+      if (!isBridgeOnlyPath(devicePath)) {
+        this.snapshot.settings = this.settingsStore.update({ selectedBridgePath: devicePath });
+      }
+      return true;
+    }
+    if (reportedUniqueId) {
+      this.recordBridgeContainer(reportedUniqueId, devicePath);
+    }
+    this.probedBridgePaths.add(devicePath.toLowerCase());
+    this.closeDevice();
+    this.markBridgeUnavailableAfterDisconnect(rawDevices, this.normalFirmwarePresent(rawDevices));
+    this.emitSnapshot();
+    return false;
+  }
+
+  /** A bridge's controller persona looks like a DualSense, so a listed bridge is never normal firmware. */
+  private normalFirmwarePresent(rawDevices: HidDeviceSummary[]): boolean {
+    return rawDevices.some(isDualSenseDevice) && !this.bridgeCensus?.bridges.length;
   }
 
   private syncAudioHelperBridgeTarget(): void {
@@ -4275,6 +4991,7 @@ export class BridgeService extends EventEmitter {
   ): void {
     if (identity?.bridgeId) {
       this.connectedBridgeUniqueId = identity.bridgeId.toLowerCase();
+      this.noteSelectedBridgeIdentity(this.connectedBridgeUniqueId);
     }
     if (!controllerConnected) {
       this.connectedControllerMac = null;
@@ -4289,6 +5006,31 @@ export class BridgeService extends EventEmitter {
       }
     }
     this.recordBridgeIdentityAssociation();
+  }
+
+  /**
+   * The connected bridge's firmware ID is authoritative for whose workspace
+   * the live settings are. Runs before the profile binding and the settings
+   * reapply, so a bridge is only ever sent its own settings. With no bridge
+   * selected yet, the connected one becomes the selection.
+   */
+  private noteSelectedBridgeIdentity(uniqueId: string): void {
+    const devicePath = this.device?.path;
+    if (!devicePath || isBridgeOnlyPath(devicePath)) {
+      return;
+    }
+    const settings = this.settingsStore.get();
+    const selectedPath = settings.selectedBridgePath;
+    if (selectedPath && !BridgeService.bridgePathsEqual(selectedPath, devicePath)) {
+      return;
+    }
+    if (selectedPath && settings.selectedBridgeUniqueId === uniqueId) {
+      return;
+    }
+    this.snapshot.settings = this.settingsStore.update({
+      selectedBridgePath: selectedPath ?? devicePath,
+      selectedBridgeUniqueId: uniqueId
+    });
   }
 
   private applyBoundControllerProfile(): CompanionSettings {
@@ -4308,32 +5050,35 @@ export class BridgeService extends EventEmitter {
     return this.settingsStore.selectControllerProfile(profileId);
   }
 
+  /**
+   * Records the container the connected bridge is on, so it is recognized,
+   * named and ranked there after it disconnects. A bridge-only container is
+   * remembered without replacing the bridge's controller-persona one.
+   */
   private recordBridgeIdentityAssociation(): void {
     const uniqueId = this.connectedBridgeUniqueId;
     const devicePath = this.device?.path;
-    if (!uniqueId || !devicePath || BridgeService.isBridgeOnlyPath(devicePath)) {
-      return;
+    if (uniqueId && devicePath) {
+      this.recordBridgeContainer(uniqueId, devicePath);
     }
+  }
+
+  private recordBridgeContainer(uniqueId: string, devicePath: string): void {
     const containerId = this.bridgeCensus?.bridges.find((bridge) => (
       BridgeService.bridgePathsEqual(bridge.path, devicePath)
     ))?.containerId ?? null;
     if (!containerId) {
       return;
     }
-    const settings = this.settingsStore.get();
-    const existing = settings.bridgeIdentities[uniqueId];
-    if (existing?.containerId?.toLowerCase() === containerId.toLowerCase()) {
-      return;
+    const bridgeIdentities = claimBridgeContainer(
+      this.settingsStore.get().bridgeIdentities,
+      uniqueId,
+      containerId,
+      isBridgeOnlyPath(devicePath)
+    );
+    if (bridgeIdentities) {
+      this.snapshot.settings = this.settingsStore.update({ bridgeIdentities });
     }
-    this.snapshot.settings = this.settingsStore.update({
-      bridgeIdentities: {
-        ...settings.bridgeIdentities,
-        [uniqueId]: {
-          label: existing?.label ?? null,
-          containerId
-        }
-      }
-    });
   }
 
   async setBridgeLabel(uniqueId: string, label: string | null): Promise<BridgeSnapshot> {
@@ -4350,13 +5095,22 @@ export class BridgeService extends EventEmitter {
       bridgeIdentities: {
         ...settings.bridgeIdentities,
         [normalizedUniqueId]: {
-          label: normalizedLabel || null,
-          containerId: settings.bridgeIdentities[normalizedUniqueId]?.containerId ?? null
+          ...(settings.bridgeIdentities[normalizedUniqueId] ?? { containerId: null }),
+          label: normalizedLabel || null
         }
       }
     });
     this.emitSnapshot();
     return this.getSnapshot();
+  }
+
+  private uniqueIdForCensusBridge(bridge: BridgeCensusEntry, settings: CompanionSettings): string | null {
+    return uniqueIdForCensusRow(
+      bridge,
+      settings.bridgeIdentities,
+      this.device?.path ?? null,
+      this.connectedBridgeUniqueId
+    );
   }
 
   private bridgeDevicesSnapshot(): BridgeDeviceCensus | null {
@@ -4365,30 +5119,14 @@ export class BridgeService extends EventEmitter {
     }
     const settings = this.settingsStore.get();
     const selectedPath = settings.selectedBridgePath;
-    const activePath = this.device?.path ?? null;
-    const uniqueIdForBridge = (path: string, containerId: string | null): string | null => {
-      if (BridgeService.bridgePathsEqual(path, activePath) && this.connectedBridgeUniqueId) {
-        return this.connectedBridgeUniqueId;
-      }
-      if (!containerId) {
-        return null;
-      }
-      return Object.entries(settings.bridgeIdentities).find(([, identity]) => (
-        identity.containerId?.toLowerCase() === containerId.toLowerCase()
-      ))?.[0] ?? null;
-    };
     return {
-      bridges: this.bridgeCensus.bridges.map((bridge) => {
-        const uniqueId = uniqueIdForBridge(bridge.path, bridge.containerId);
-        return {
-          path: bridge.path,
-          containerId: bridge.containerId,
-          selected: BridgeService.bridgePathsEqual(bridge.path, activePath)
-            || Boolean(selectedPath && BridgeService.bridgePathsEqual(bridge.path, selectedPath)),
-          connected: BridgeService.bridgePathsEqual(bridge.path, activePath),
-          uniqueId,
-          name: uniqueId ? settings.bridgeIdentities[uniqueId]?.label ?? null : null
-        };
+      bridges: projectBridgeDevices({
+        census: this.bridgeCensus.bridges,
+        identities: settings.bridgeIdentities,
+        selectedPath,
+        selectedUniqueId: settings.selectedBridgeUniqueId,
+        activePath: this.device?.path ?? null,
+        activeUniqueId: this.connectedBridgeUniqueId
       }),
       directControllers: this.bridgeCensus.hidDevices
         .filter((device) => !device.isBridge)
@@ -4402,15 +5140,23 @@ export class BridgeService extends EventEmitter {
   }
 
   async selectBridge(devicePath: string | null): Promise<BridgeSnapshot> {
-    await this.refreshBridgeCensus();
+    this.probedBridgePaths.clear();
+    // A bridge from the list switches at once; only one the last census has
+    // not seen waits for a new one, as in Kitsune Input.
+    if (devicePath !== null && !this.bridgeCensusHasPath(devicePath)) {
+      await this.refreshBridgeCensus();
+    }
     let selectedPath: string | null = null;
+    let selectedUniqueId: string | null = null;
     if (devicePath !== null) {
-      selectedPath = this.bridgeCensus?.bridges.find((bridge) => (
+      const selected = this.bridgeCensus?.bridges.find((bridge) => (
         BridgeService.bridgePathsEqual(bridge.path, devicePath)
-      ))?.path ?? null;
-      if (!selectedPath) {
+      ));
+      if (!selected) {
         throw new Error('The selected bridge is no longer connected.');
       }
+      selectedPath = selected.path;
+      selectedUniqueId = this.uniqueIdForCensusBridge(selected, this.settingsStore.get());
     }
     const switchingDevices = Boolean(
       this.device
@@ -4420,7 +5166,12 @@ export class BridgeService extends EventEmitter {
     if (switchingDevices) {
       await this.stopControllerAudioPolling();
     }
-    this.snapshot.settings = this.settingsStore.update({ selectedBridgePath: selectedPath });
+    // Selecting a bridge stores the outgoing bridge's workspace and loads the
+    // incoming one's; its controller is sent those settings on reconnect.
+    this.snapshot.settings = this.settingsStore.update({
+      selectedBridgePath: selectedPath,
+      selectedBridgeUniqueId: selectedUniqueId
+    });
     if (switchingDevices) {
       this.closeDevice();
     } else {
@@ -4431,12 +5182,13 @@ export class BridgeService extends EventEmitter {
   }
 
   async refreshBridgeDevices(): Promise<BridgeSnapshot> {
+    this.probedBridgePaths.clear();
     const [, rawDevices] = await Promise.all([
       this.refreshBridgeCensus(),
       this.refreshUnavailableDevices(true)
     ]);
     if (!this.device) {
-      this.markBridgeUnavailableAfterDisconnect(rawDevices, rawDevices.some(isDualSenseDevice));
+      this.markBridgeUnavailableAfterDisconnect(rawDevices, this.normalFirmwarePresent(rawDevices));
     }
     this.emitSnapshot();
     return this.getSnapshot();
@@ -4461,6 +5213,7 @@ export class BridgeService extends EventEmitter {
   private closeDevice(): void {
     const device = this.device;
     this.device = null;
+    this.resetEvidence = null;
     this.connectedBridgeUniqueId = null;
     this.connectedControllerMac = null;
     this.bindingAppliedForMac = null;
@@ -4480,7 +5233,7 @@ export class BridgeService extends EventEmitter {
     this.feedbackTraceSupported = null;
     this.firmwareLogEnabled = null;
     this.controllerPowerSavingActive = null;
-    this.systemAudioHapticsRetryAt = 0;
+    this.resetSystemAudioHapticsRecovery();
     this.systemAudioHapticsPassthroughActive = false;
     this.syncAudioHelperBridgeTarget();
     void this.stopControllerAudioPolling();
@@ -4518,7 +5271,11 @@ export class BridgeService extends EventEmitter {
       personaTransition,
       bridgeDevices: this.bridgeDevicesSnapshot()
     };
-    const publicSnapshot = this.getSnapshot();
+    // Most calls change nothing the renderer shows. Compare first and deep-clone
+    // only the snapshot that is actually delivered.
+    const stickInputPreview = this.stickInputPreviewLeaseUntil > Date.now()
+      ? this.stickInputPreview
+      : null;
     const signature = JSON.stringify({
       state: this.snapshot.state,
       message: this.snapshot.message,
@@ -4531,7 +5288,8 @@ export class BridgeService extends EventEmitter {
       settings: this.snapshot.settings,
       personaTransition: this.snapshot.personaTransition,
       bridgeDevices: this.snapshot.bridgeDevices,
-      stickInputPreview: publicSnapshot.stickInputPreview,
+      stickInputPreview,
+      bootloaderConfirmation: this.bootloaderConfirmation,
       diagnostics: {
         hidPath: this.snapshot.diagnostics.hidPath,
         protocolVersion: this.snapshot.diagnostics.protocolVersion,
@@ -4540,6 +5298,7 @@ export class BridgeService extends EventEmitter {
         lastError: this.snapshot.diagnostics.lastError,
         firmwareUpdateAvailable: this.snapshot.diagnostics.firmwareUpdateAvailable,
         deviceIdentity: this.snapshot.diagnostics.deviceIdentity,
+        resetEvidence: this.snapshot.diagnostics.resetEvidence ?? null,
         firmwareLogDirectory: this.snapshot.diagnostics.firmwareLogDirectory,
         firmwareLogPath: this.snapshot.diagnostics.firmwareLogPath,
         firmwareLogEnabled: this.snapshot.diagnostics.firmwareLogEnabled,
@@ -4562,6 +5321,6 @@ export class BridgeService extends EventEmitter {
       return;
     }
     this.lastEmittedSnapshotSignature = signature;
-    this.emit('snapshot', publicSnapshot);
+    this.emit('snapshot', this.getSnapshot());
   }
 }

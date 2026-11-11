@@ -94,6 +94,23 @@ vi.mock('./audio-helper', async (importOriginal) => {
   };
 });
 
+// The resident census helper is covered by bridge-census-client.test.ts; here
+// each census is the mocked list.
+const censusClientMock = vi.hoisted(() => ({ resident: true }));
+vi.mock('./bridge-census-client', () => ({
+  BridgeCensusClient: class {
+    list() {
+      return audioHelperMock.listBridges();
+    }
+
+    isResident() {
+      return censusClientMock.resident;
+    }
+
+    stop() {}
+  }
+}));
+
 import { BridgeService } from './bridge-service';
 import { SettingsStore } from './settings-store';
 
@@ -134,9 +151,10 @@ const FULL_REAPPLY_COMMANDS = [
   COMMAND_ID.SET_TRIGGER_EFFECT_INTENSITY,
   COMMAND_ID.SET_SPEAKER_GAIN,
   COMMAND_ID.SET_SPEAKER_VOLUME,
-  COMMAND_ID.SET_DUPLEX_ENABLED,
+  // The mic is enabled by default, so its mute state is set before enabling.
   COMMAND_ID.SET_MIC_VOLUME,
   COMMAND_ID.SET_MIC_MUTE,
+  COMMAND_ID.SET_DUPLEX_ENABLED,
   COMMAND_ID.SET_LED_ENABLED,
   COMMAND_ID.SET_PLAYER_LED_ENABLED,
   COMMAND_ID.SET_IDLE_DISCONNECT_ENABLED,
@@ -160,6 +178,8 @@ class MockHidDevice extends EventEmitter {
   audioStatusReports: number[][] = [];
   firmwareLogReports: number[][] = [];
   deviceIdentity = deviceIdentityReport();
+  /** Firmware before 2.0 has no reset evidence report. */
+  resetEvidence: number[] | null = null;
   shortcutEvents: number[] = [];
   inputReports: number[][] = [];
   shortcutReadError: Error | null = null;
@@ -222,6 +242,12 @@ class MockHidDevice extends EventEmitter {
     }
     if (reportId === REPORT_ID.DEVICE_IDENTITY) {
       return [...this.deviceIdentity];
+    }
+    if (reportId === REPORT_ID.RESET_EVIDENCE) {
+      if (!this.resetEvidence) {
+        throw new Error('Unexpected report ID: 19');
+      }
+      return [...this.resetEvidence];
     }
     if (reportId === REPORT_ID.FIRMWARE_LOG) {
       return [...(this.firmwareLogReports.shift() ?? firmwareLogReport([], { enabled: false }))];
@@ -583,6 +609,12 @@ async function flushImmediate(): Promise<void> {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
+/** A persona switch reattaches the bridge's USB: the transport closes and the next poll opens it again. */
+async function reattachAfterPersonaSwitch(device: MockHidDevice): Promise<void> {
+  device.emit('close');
+  await flushImmediate();
+}
+
 describe('BridgeService', () => {
   let tempDirs: string[] = [];
   let services: BridgeService[] = [];
@@ -720,6 +752,29 @@ describe('BridgeService', () => {
     await flushImmediate();
 
     expect(service.getSnapshot().settings.micMuted).toBe(false);
+  });
+
+  it('leaves the 20 Hz shortcut timer idle while no controller is connected', async () => {
+    const service = serviceFixture();
+    const device = new MockHidDevice();
+    device.status = statusReport({ controllerConnected: false });
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set('companion-path', device);
+    const runShortcutPoll = () => (service as unknown as { runShortcutPoll(): void }).runShortcutPoll();
+
+    await poll(service);
+    const reads = () => device.featureReportIds.filter((id) => id === REPORT_ID.INPUT).length;
+    const afterStatusPoll = reads();
+    runShortcutPoll();
+    await flushImmediate();
+    expect(reads()).toBe(afterStatusPoll);
+
+    device.status = statusReport({ controllerConnected: true });
+    await poll(service);
+    const afterConnect = reads();
+    runShortcutPoll();
+    await flushImmediate();
+    expect(reads()).toBe(afterConnect + 1);
   });
 
   it('does not start the companion interrupt input read loop', async () => {
@@ -862,14 +917,14 @@ describe('BridgeService', () => {
     expect(snapshot.diagnostics.lastError).toBeNull();
     expect(snapshot.diagnostics.firmwareUpdateAvailable).toEqual({
       currentVersion: '1.6.3',
-      availableVersion: '1.7.1'
+      availableVersion: '2.0.1'
     });
   });
 
   it('does not surface an available update for the bundled bridge firmware', async () => {
     const service = serviceFixture();
     const device = new MockHidDevice();
-    device.status = statusReport({ firmwareMajor: 1, firmwareMinor: 7, firmwarePatch: 1 });
+    device.status = statusReport({ firmwareMajor: 2, firmwareMinor: 0, firmwarePatch: 1 });
     hidMock.state.devicesList = [companionDeviceInfo()];
     hidMock.state.openDevices.set('companion-path', device);
 
@@ -877,7 +932,7 @@ describe('BridgeService', () => {
 
     const snapshot = service.getSnapshot();
     expect(snapshot.state).toBe('connected');
-    expect(snapshot.status?.firmwareVersion).toBe('1.7.1');
+    expect(snapshot.status?.firmwareVersion).toBe('2.0.1');
     expect(snapshot.diagnostics.firmwareUpdateAvailable).toBeNull();
   });
 
@@ -922,8 +977,13 @@ describe('BridgeService', () => {
     hidMock.state.devicesList = [companionDeviceInfo()];
     hidMock.state.openDevices.set('companion-path', device);
 
-    const start = vi.fn(async () => undefined);
-    const stop = vi.fn(async () => undefined);
+    let running = false;
+    const start = vi.fn(async () => {
+      running = true;
+    });
+    const stop = vi.fn(async () => {
+      running = false;
+    });
     const internals = service as unknown as {
       systemAudioHapticsEngine: {
         start: typeof start;
@@ -934,7 +994,7 @@ describe('BridgeService', () => {
     internals.systemAudioHapticsEngine = {
       start,
       stop,
-      isActive: () => false
+      isActive: () => running
     };
 
     await poll(service);
@@ -1011,6 +1071,81 @@ describe('BridgeService', () => {
     }), 'dualsense');
   });
 
+  it('resumes app audio haptics when the selected app comes back under a new process', async () => {
+    const appSource = {
+      kind: 'app-session' as const,
+      processId: 4321,
+      displayName: 'Microsoft Edge',
+      executableName: 'msedge.exe',
+      processPath: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
+    };
+    const service = serviceFixture({
+      audioReactiveHapticsEnabled: true,
+      audioReactiveHapticsSource: appSource
+    });
+    const device = new MockHidDevice();
+    device.settingsRevision = 4;
+    device.status = statusReport({ controllerConnected: true, settingsRevision: 4, uptimeSeconds: 30 });
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set('companion-path', device);
+
+    let running = false;
+    const start = vi.fn(async () => {
+      running = true;
+    });
+    const stop = vi.fn(async () => {
+      running = false;
+    });
+    const session = (processId: number, state: string) => ({
+      processId,
+      displayName: 'Microsoft Edge',
+      executableName: 'msedge.exe',
+      processPath: appSource.processPath,
+      iconPath: null,
+      sessionIdentifier: null,
+      sessionInstanceIdentifier: null,
+      state,
+      endpointName: 'Speakers',
+      isSelected: true
+    });
+    let sessions = [session(4321, 'inactive')];
+    const listSessions = vi.fn(async () => sessions);
+    const internals = service as unknown as {
+      systemAudioHapticsEngine: { start: typeof start; stop: typeof stop; isActive(): boolean };
+      audioHapticsSessionMonitor: { listSessions: typeof listSessions; stop(): Promise<void> };
+      audioHapticsSessionCache: unknown;
+      systemAudioHapticsRetryAt: number;
+      handleSystemAudioHapticsStatus(line: string): Promise<void>;
+    };
+    internals.systemAudioHapticsEngine = { start, stop, isActive: () => running };
+    internals.audioHapticsSessionMonitor = { listSessions, stop: async () => undefined };
+
+    await poll(service);
+    await flushReapply();
+    expect(start).toHaveBeenCalledOnce();
+
+    // The app exits; until it returns, the helper reports its session missing.
+    start.mockRejectedValueOnce(Object.assign(
+      new Error('Selected audio app is not available for haptics yet.'),
+      { reason: 'app-session-unavailable' }
+    ));
+    await internals.handleSystemAudioHapticsStatus('status: route-changed reason=app-session-exited processId=4321');
+    expect(start).toHaveBeenCalledTimes(2);
+
+    // The exited process's lingering session does not count as the app returning.
+    internals.systemAudioHapticsRetryAt = 0;
+    await poll(service);
+    expect(listSessions).toHaveBeenCalled();
+    expect(start).toHaveBeenCalledTimes(2);
+
+    sessions = [session(4321, 'expired'), session(9876, 'active')];
+    internals.audioHapticsSessionCache = null;
+    internals.systemAudioHapticsRetryAt = 0;
+    await poll(service);
+    expect(start).toHaveBeenCalledTimes(3);
+    expect(running).toBe(true);
+  });
+
   it('ignores firmware-reported mic unmute when duplex mic is disabled', async () => {
     const service = serviceFixture({ duplexMicEnabled: false, micMuted: true });
     const device = new MockHidDevice();
@@ -1039,6 +1174,61 @@ describe('BridgeService', () => {
     await poll(service);
 
     expect(service.getSnapshot().settings.micMuted).toBe(true);
+  });
+
+  it('marks reapplied lightbar colors as refreshes and explicit changes as immediate', async () => {
+    const service = serviceFixture();
+    const device = new MockHidDevice();
+    device.settingsRevision = 4;
+    device.status = statusReport({ controllerConnected: true, settingsRevision: 4, uptimeSeconds: 30 });
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set('companion-path', device);
+
+    await poll(service);
+    await flushReapply();
+    const lightbarFlags = (from: number) => device.sentReports.slice(from)
+      .filter((report) => report[7] === COMMAND_ID.SET_LIGHTBAR_COLOR)
+      .map((report) => report[14]);
+
+    // Firmware only saves a refreshed color while a game shows its own.
+    expect(lightbarFlags(0)).toEqual([1]);
+
+    let mark = device.sentReports.length;
+    await service.setLightbarColor('#112233', 50);
+    expect(lightbarFlags(mark)).toEqual([0]);
+
+    mark = device.sentReports.length;
+    await service.setLightbarEnabled(false);
+    expect(lightbarFlags(mark)).toEqual([0]);
+  });
+
+  it('toggles Mic Enabled without passing through an enabled, muted mic', async () => {
+    const service = serviceFixture({ duplexMicEnabled: true, micMuted: false });
+    const device = new MockHidDevice();
+    device.settingsRevision = 4;
+    device.status = statusReport({ controllerConnected: true, settingsRevision: 4, uptimeSeconds: 30 });
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set('companion-path', device);
+
+    await poll(service);
+    await flushReapply();
+    const micCommands = (from: number) => device.sentReports.slice(from)
+      .filter((report) => report[7] === COMMAND_ID.SET_DUPLEX_ENABLED || report[7] === COMMAND_ID.SET_MIC_MUTE)
+      .map((report) => [report[7], report[9]]);
+
+    let mark = device.sentReports.length;
+    await service.setDuplexMicEnabled(false);
+    expect(micCommands(mark)).toEqual([
+      [COMMAND_ID.SET_DUPLEX_ENABLED, 0],
+      [COMMAND_ID.SET_MIC_MUTE, 1]
+    ]);
+
+    mark = device.sentReports.length;
+    await service.setDuplexMicEnabled(true);
+    expect(micCommands(mark)).toEqual([
+      [COMMAND_ID.SET_MIC_MUTE, 0],
+      [COMMAND_ID.SET_DUPLEX_ENABLED, 1]
+    ]);
   });
 
   it('syncs firmware-reported mic mute after startup settings reapply when duplex mic is enabled', async () => {
@@ -1120,7 +1310,7 @@ describe('BridgeService', () => {
     expect(audioHelperMock.playBridgeHapticsTestPattern).toHaveBeenCalledWith(130, hostPersonaMode);
   });
 
-  it('skips test haptics while a host persona transition is active', async () => {
+  it('rejects test haptics with guidance while a host persona transition is active', async () => {
     const service = serviceFixture({ hapticsGainPercent: 130 });
     const device = new MockHidDevice();
     device.status = statusReport({
@@ -1133,14 +1323,17 @@ describe('BridgeService', () => {
 
     await poll(service);
     await service.setHostPersonaMode('xbox');
-    const snapshot = await service.testHaptics();
+    await expect(service.testHaptics()).rejects.toThrow(
+      'Haptics test could not start while switching controller modes. Wait for the controller to reconnect, then try again.'
+    );
 
+    const snapshot = await service.getSnapshot();
     expect(audioHelperMock.playBridgeHapticsTestPattern).not.toHaveBeenCalled();
     expect(snapshot.personaTransition?.to).toBe('xbox');
     expect(snapshot.state).toBe('transitioning');
   });
 
-  it('does not reject test haptics when the persona audio endpoint is still reconnecting', async () => {
+  it('waits for a persona audio endpoint that is still reconnecting', async () => {
     const service = serviceFixture({ hapticsGainPercent: 130 });
     const device = new MockHidDevice();
     device.status = statusReport({ hostPersonaMode: 'xbox', supportedHostPersonaModesMask: 0x07 });
@@ -1153,8 +1346,120 @@ describe('BridgeService', () => {
     await poll(service);
     const snapshot = await service.testHaptics();
 
-    expect(audioHelperMock.playBridgeHapticsTestPattern).toHaveBeenCalledWith(130, 'xbox');
+    expect(audioHelperMock.playBridgeHapticsTestPattern).toHaveBeenCalledTimes(2);
+    expect(audioHelperMock.playBridgeHapticsTestPattern).toHaveBeenLastCalledWith(130, 'xbox');
     expect(snapshot.settings.hapticsGainPercent).toBe(130);
+  });
+
+  it('reports a missing persona audio endpoint once the wait expires', async () => {
+    const service = serviceFixture({ hapticsGainPercent: 130 });
+    const device = new MockHidDevice();
+    device.status = statusReport({ hostPersonaMode: 'xbox', supportedHostPersonaModesMask: 0x07 });
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set('companion-path', device);
+    audioHelperMock.playBridgeHapticsTestPattern.mockRejectedValue(new Error(
+      "Unhandled exception. System.InvalidOperationException: Render endpoint matching persona 'xbox' ('Xbox 360 Controller for Windows') was not found."
+    ));
+
+    await poll(service);
+    let now = Date.now();
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => {
+      now += 3000;
+      return now;
+    });
+    try {
+      await expect(service.testHaptics()).rejects.toThrow(
+        'The controller audio endpoint is unavailable. Close any games using the controller and try again.'
+      );
+    } finally {
+      nowSpy.mockRestore();
+    }
+    expect(audioHelperMock.playBridgeHapticsTestPattern).toHaveBeenCalledTimes(2);
+  });
+
+  it('says how to fix a bridge audio endpoint that is disabled in Windows, without waiting for it', async () => {
+    const service = serviceFixture();
+    const device = new MockHidDevice();
+    device.status = statusReport({ hostPersonaMode: 'dualsense', supportedHostPersonaModesMask: 0x07 });
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set('companion-path', device);
+    audioHelperMock.playBridgeHapticsTestPattern.mockRejectedValueOnce(new Error(
+      "Unhandled exception. System.InvalidOperationException: The bridge's render endpoint 'Speakers (DualSense Wireless Controller)' is disabled in Windows Sound settings."
+    ));
+
+    await poll(service);
+    await expect(service.testHaptics()).rejects.toThrow(
+      'The controller audio device is disabled in Windows. Enable it under Sound settings > More sound settings, then try again.'
+    );
+    expect(audioHelperMock.playBridgeHapticsTestPattern).toHaveBeenCalledOnce();
+  });
+
+  it('rejects other test haptics failures with retry guidance', async () => {
+    const service = serviceFixture({ hapticsGainPercent: 130 });
+    const device = new MockHidDevice();
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set('companion-path', device);
+    audioHelperMock.playBridgeHapticsTestPattern.mockRejectedValueOnce(new Error('Haptics test helper timed out.'));
+
+    await poll(service);
+
+    await expect(service.testHaptics()).rejects.toThrow(
+      'Haptics test failed. Close any games using the controller and try again. If it still fails, reconnect the controller.'
+    );
+    expect(audioHelperMock.playBridgeHapticsTestPattern).toHaveBeenCalledOnce();
+  });
+
+  it('pauses system audio haptics while test haptics plays and runs one test at a time', async () => {
+    const service = serviceFixture({ audioReactiveHapticsEnabled: true, hapticsGainPercent: 130 });
+    const device = new MockHidDevice();
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set('companion-path', device);
+
+    await poll(service);
+    await flushReapply();
+
+    const events: string[] = [];
+    let running = true;
+    const internals = service as unknown as {
+      systemAudioHapticsEngine: {
+        start(): Promise<void>;
+        stop(): Promise<void>;
+        isActive(): boolean;
+      };
+      resetSystemAudioHapticsRecovery(): void;
+    };
+    // The fixture's real helper cannot launch here; clear its retry backoff.
+    internals.resetSystemAudioHapticsRecovery();
+    internals.systemAudioHapticsEngine = {
+      start: vi.fn(async () => {
+        events.push('system-start');
+        running = true;
+      }),
+      stop: vi.fn(async () => {
+        if (running) {
+          events.push('system-stop');
+        }
+        running = false;
+      }),
+      isActive: () => running
+    };
+    let finishPattern: () => void = () => undefined;
+    audioHelperMock.playBridgeHapticsTestPattern.mockImplementationOnce(async () => {
+      events.push('test-start');
+      await new Promise<void>((resolve) => {
+        finishPattern = resolve;
+      });
+      events.push('test-end');
+    });
+
+    const first = service.testHaptics();
+    const second = service.testHaptics();
+    await vi.waitFor(() => expect(events).toContain('test-start'));
+    finishPattern();
+    await Promise.all([first, second]);
+
+    expect(audioHelperMock.playBridgeHapticsTestPattern).toHaveBeenCalledOnce();
+    expect(events).toEqual(['system-stop', 'test-start', 'test-end', 'system-start']);
   });
 
   it('plays test speaker through the current persona audio endpoint', async () => {
@@ -1228,6 +1533,69 @@ describe('BridgeService', () => {
       resultCode: ACK_RESULT.OK
     });
     expect(snapshot.diagnostics.lastError).toContain('expected command 0x01 sequence');
+  });
+
+  it('reads why the bridge last reset once per bridge session', async () => {
+    const service = serviceFixture();
+    const device = new MockHidDevice();
+    device.status = statusReport({ controllerConnected: false, uptimeSeconds: 10 });
+    const evidence = new Array<number>(REPORT_LENGTH).fill(0);
+    evidence[0] = REPORT_ID.RESET_EVIDENCE;
+    writeMagic(evidence);
+    writeVersion(evidence);
+    evidence[7] = 1;
+    evidence[8] = 0x03;
+    evidence[9] = 5;
+    evidence[11] = 1;
+    writeU32(evidence, 12, 60_000);
+    device.resetEvidence = evidence;
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set('companion-path', device);
+
+    await poll(service);
+    await poll(service);
+
+    expect(service.getSnapshot().diagnostics.resetEvidence).toMatchObject({
+      watchdogReset: true, phase: 'audio', reason: 'watchdog-timeout', uptimeBeforeResetMs: 60_000
+    });
+    expect(device.featureReportIds.filter((id) => id === REPORT_ID.RESET_EVIDENCE)).toHaveLength(1);
+
+    // A lower uptime means the bridge rebooted: its new evidence is read again.
+    device.status = statusReport({ controllerConnected: false, uptimeSeconds: 2 });
+    evidence[8] = 0;
+    await poll(service);
+    expect(service.getSnapshot().diagnostics.resetEvidence).toMatchObject({ watchdogReset: false });
+    expect(device.featureReportIds.filter((id) => id === REPORT_ID.RESET_EVIDENCE)).toHaveLength(2);
+  });
+
+  it('waits for the deferred Wake-on-LAN ACK instead of rejecting the previous one', async () => {
+    const service = serviceFixture();
+    const device = new MockHidDevice();
+    device.status = statusReport({ controllerConnected: false });
+    // Firmware ACKs a queued Wake-on-LAN command on its next main-loop pass,
+    // so the first reads can still show the previous command.
+    for (let index = 0; index < 2; index++) {
+      device.ackReports.push(ackReport({
+        commandId: COMMAND_ID.SET_SPEAKER_VOLUME,
+        sequence: 99,
+        result: ACK_RESULT.OK,
+        settingsRevision: 0
+      }));
+    }
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set('companion-path', device);
+    await poll(service);
+
+    await (service as unknown as {
+      sendWakeOnLanCommand(operation: number, payload: Uint8Array): Promise<void>;
+    }).sendWakeOnLanCommand(7, new Uint8Array([4, 0, 0, 0]));
+
+    const sent = device.sentReports.at(-1)!;
+    expect(sent[7]).toBe(COMMAND_ID.WAKE_ON_LAN);
+    expect(sent[9]).toBe(7);
+    expect(sent.slice(11, 15)).toEqual([4, 0, 0, 0]);
+    expect(device.featureReportIds.filter((id) => id === REPORT_ID.ACK).length).toBeGreaterThanOrEqual(3);
+    expect(service.getSnapshot().diagnostics.lastError).toBeNull();
   });
 
   it('serializes overlapping companion commands before reading ACK reports', async () => {
@@ -1544,6 +1912,82 @@ describe('BridgeService', () => {
     }), 'ds4');
   });
 
+  it('backs off system audio haptics restarts while the helper keeps exiting', async () => {
+    const service = serviceFixture({
+      audioReactiveHapticsEnabled: true
+    });
+    const device = new MockHidDevice();
+    device.status = statusReport({ hostPersonaMode: 'ds4', supportedHostPersonaModesMask: 0x07 });
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set('companion-path', device);
+
+    await poll(service);
+
+    let running = false;
+    const start = vi.fn(async () => {
+      running = true;
+    });
+    const stop = vi.fn(async () => {
+      running = false;
+    });
+    const internals = service as unknown as {
+      systemAudioHapticsEngine: {
+        start: typeof start;
+        stop: typeof stop;
+        isActive(): boolean;
+      };
+      systemAudioHapticsRetryAt: number;
+      handleSystemAudioHapticsStatus(line: string): Promise<void>;
+      updateSystemAudioHapticsEngine(): Promise<void>;
+      resetSystemAudioHapticsRecovery(): void;
+    };
+    internals.systemAudioHapticsEngine = {
+      start,
+      stop,
+      isActive: () => running
+    };
+    await flushReapply();
+    running = false;
+    internals.resetSystemAudioHapticsRecovery();
+
+    let now = 1_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const crashAfterStart = async () => {
+        await internals.updateSystemAudioHapticsEngine();
+        now += 1000;
+        running = false;
+        await internals.handleSystemAudioHapticsStatus('system audio haptics helper exited (1)');
+        return internals.systemAudioHapticsRetryAt - now;
+      };
+
+      expect(await crashAfterStart()).toBe(5000);
+      start.mockClear();
+      await internals.updateSystemAudioHapticsEngine();
+      expect(start).not.toHaveBeenCalled();
+
+      now = internals.systemAudioHapticsRetryAt;
+      expect(await crashAfterStart()).toBe(10000);
+      now = internals.systemAudioHapticsRetryAt;
+      expect(await crashAfterStart()).toBe(20000);
+      now = internals.systemAudioHapticsRetryAt;
+      expect(await crashAfterStart()).toBe(30000);
+      now = internals.systemAudioHapticsRetryAt;
+      expect(await crashAfterStart()).toBe(30000);
+
+      // A run that lasts past the stability window clears the backoff.
+      now = internals.systemAudioHapticsRetryAt;
+      await internals.updateSystemAudioHapticsEngine();
+      now += 15000;
+      running = false;
+      await internals.handleSystemAudioHapticsStatus('system audio haptics helper exited (0)');
+      expect(internals.systemAudioHapticsRetryAt).toBe(0);
+      expect(await crashAfterStart()).toBe(5000);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
   it('restarts system audio haptics after a host persona transition completes', async () => {
     const service = serviceFixture({
       audioReactiveHapticsEnabled: true
@@ -1583,12 +2027,13 @@ describe('BridgeService', () => {
     await service.setHostPersonaMode('xbox');
     expect(stop).toHaveBeenCalledOnce();
 
-    stop.mockClear();
     device.status = statusReport({
       controllerConnected: true,
       hostPersonaMode: 'xbox',
       supportedHostPersonaModesMask: 0x07
     });
+    await reattachAfterPersonaSwitch(device);
+    stop.mockClear();
     await poll(service);
 
     expect(stop).toHaveBeenCalledOnce();
@@ -1596,6 +2041,48 @@ describe('BridgeService', () => {
       source: 'system-audio',
       gainPercent: 100
     }), 'xbox');
+  });
+
+  it('notifies once when a host persona switch completes, unless turned off', async () => {
+    const service = serviceFixture();
+    const device = new MockHidDevice();
+    device.status = statusReport({
+      controllerConnected: false,
+      hostPersonaMode: 'dualsense',
+      supportedHostPersonaModesMask: 0x07
+    });
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set('companion-path', device);
+    const toasts: Array<{ title: string; body: string }> = [];
+    service.on('toast', (toast) => toasts.push(toast));
+    (service as unknown as { getDefaultRenderEndpointStatus(): Promise<unknown> }).getDefaultRenderEndpointStatus = vi.fn(
+      async () => ({ deviceName: 'Speakers', isBridgeEndpoint: false })
+    );
+    await poll(service);
+    expect(service.getSnapshot().settings.notifyPersonaChange).toBe(true);
+
+    await service.setHostPersonaMode('ds4');
+    expect(toasts).toEqual([]);
+    device.status = statusReport({
+      controllerConnected: false,
+      hostPersonaMode: 'ds4',
+      supportedHostPersonaModesMask: 0x07
+    });
+    await reattachAfterPersonaSwitch(device);
+    await poll(service);
+    await poll(service);
+    expect(toasts).toEqual([{ title: 'DS5 Bridge', body: 'Switched to DualShock 4 mode' }]);
+
+    await service.setNotifyPersonaChange(false);
+    await service.setHostPersonaMode('dualsense');
+    device.status = statusReport({
+      controllerConnected: false,
+      hostPersonaMode: 'dualsense',
+      supportedHostPersonaModesMask: 0x07
+    });
+    await reattachAfterPersonaSwitch(device);
+    await poll(service);
+    expect(toasts).toHaveLength(1);
   });
 
   it('preserves selected audio haptics app source on partial config updates', async () => {
@@ -2091,6 +2578,39 @@ describe('BridgeService', () => {
     expect(personaCommand?.[9]).toBe(1);
   });
 
+  it('shows the battery level when a Show Battery chord fires', async () => {
+    const service = serviceFixture();
+    const device = new MockHidDevice();
+    device.status = statusReport({ controllerConnected: true, batteryPercent: 42 });
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set('companion-path', device);
+    const toasts: Array<{ title: string; body: string }> = [];
+    service.on('toast', (toast) => toasts.push(toast));
+
+    await poll(service);
+    await service.setChordConfiguration([{
+      id: 'battery',
+      name: 'Battery',
+      type: 'controller-setting',
+      action: 'show-battery',
+      stepPercent: 10
+    }], [{
+      id: 'ps-create',
+      kind: 'chord',
+      starter: 'ps',
+      button: 'create',
+      functionId: 'battery'
+    }]);
+    expect(service.getSnapshot().settings.chordFunctions[0]).toMatchObject({ action: 'show-battery' });
+
+    device.queueShortcutEvent(CHORD_FUNCTION_EVENT_BASE);
+    await pollShortcut(service);
+    await flushShortcutActions(service);
+
+    // Notification settings are off; the chord asked for this one.
+    expect(toasts).toEqual([{ title: 'DS5 Bridge', body: 'Controller battery: 42% (charging)' }]);
+  });
+
   it('applies controller mic mute events without waiting for a status poll', async () => {
     const service = serviceFixture({
       duplexMicEnabled: true,
@@ -2146,6 +2666,36 @@ describe('BridgeService', () => {
 
     releaseKeepalive();
     await flushImmediate();
+  });
+
+  it('notifies about controller mic mute changes only when asked to', async () => {
+    const service = serviceFixture({
+      duplexMicEnabled: true,
+      micMuted: true,
+      muteButtonMode: 'normal'
+    });
+    const device = new MockHidDevice();
+    device.status = statusReport({ controllerConnected: false, micMuted: true });
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set('companion-path', device);
+    const toasts: Array<{ title: string; body: string }> = [];
+    service.on('toast', (toast) => toasts.push(toast));
+    await poll(service);
+    expect(service.getSnapshot().settings.notifyMicMute).toBe(false);
+
+    device.queueShortcutEvent(SHORTCUT_EVENT.MIC_MUTE_OFF);
+    await pollShortcut(service);
+    await flushShortcutActions(service);
+    expect(toasts).toEqual([]);
+
+    await service.setNotifyMicMute(true);
+    device.queueShortcutEvent(SHORTCUT_EVENT.MIC_MUTE_ON);
+    await pollShortcut(service);
+    await flushShortcutActions(service);
+    device.queueShortcutEvent(SHORTCUT_EVENT.MIC_MUTE_OFF);
+    await pollShortcut(service);
+    await flushShortcutActions(service);
+    expect(toasts.map((toast) => toast.body)).toEqual(['Controller mic muted', 'Controller mic unmuted']);
   });
 
   it('ignores controller mic mute events when mic pass-through is not armed', async () => {
@@ -2316,6 +2866,7 @@ describe('BridgeService', () => {
         hostPersonaMode: 'ds4',
         supportedHostPersonaModesMask: 0x07
       });
+      await reattachAfterPersonaSwitch(device);
       nowSpy.mockReturnValue(1_000_050);
       await poll(service);
       expect(setDefaultRenderBridgeEndpoint).toHaveBeenCalledOnce();
@@ -2576,6 +3127,13 @@ describe('BridgeService', () => {
         hostPersonaMode: 'xbox',
         supportedHostPersonaModesMask: 0x07
       });
+      // The firmware reports the new persona before it reattaches USB: the
+      // switch is not over on the transport opened before it.
+      nowSpy.mockReturnValue(1_000_100);
+      await poll(service);
+      expect(service.getSnapshot().state).toBe('transitioning');
+
+      await reattachAfterPersonaSwitch(device);
       nowSpy.mockReturnValue(1_000_500);
       await poll(service);
 
@@ -2724,6 +3282,48 @@ describe('BridgeService', () => {
     expect(named.bridgeDevices?.bridges.find((bridge) => bridge.path === bridgeB.path)?.name).toBe('Desk');
   });
 
+  it('keeps each bridge’s profiles to that bridge across selections', async () => {
+    const service = serviceFixture();
+    const bridgeA = new MockHidDevice();
+    bridgeA.path = 'winusb://bridge-a';
+    bridgeA.deviceIdentity = deviceIdentityReport({ bridgeId: 'aaaaaaaaaaaaaaaa' });
+    const bridgeB = new MockHidDevice();
+    bridgeB.path = 'winusb://bridge-b';
+    bridgeB.deviceIdentity = deviceIdentityReport({ bridgeId: 'bbbbbbbbbbbbbbbb' });
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set('bridge-a', bridgeA);
+    hidMock.state.openDevices.set('bridge-b', bridgeB);
+    audioHelperMock.listBridges.mockResolvedValue({
+      bridges: [
+        { path: bridgeA.path, containerId: '11111111-1111-1111-1111-111111111111' },
+        { path: bridgeB.path, containerId: '22222222-2222-2222-2222-222222222222' }
+      ],
+      hidDevices: []
+    });
+    const profileNames = () => service.getSnapshot().settings.controllerProfiles.map((profile) => profile.name);
+
+    await service.selectBridge(bridgeA.path);
+    await poll(service);
+    expect(service.getSnapshot().settings.selectedBridgeUniqueId).toBe('aaaaaaaaaaaaaaaa');
+    await service.saveControllerProfile('Racing');
+
+    // B has never been used, so it starts from defaults, then takes its own ID.
+    await service.selectBridge(bridgeB.path);
+    expect(profileNames()).toEqual(['Default']);
+    await poll(service);
+    expect(service.getSnapshot().settings.selectedBridgeUniqueId).toBe('bbbbbbbbbbbbbbbb');
+    await service.saveControllerProfile('Couch');
+
+    // A is recognized by its recorded container and gets its own profiles back.
+    await service.selectBridge(bridgeA.path);
+    expect(service.getSnapshot().settings.selectedBridgeUniqueId).toBe('aaaaaaaaaaaaaaaa');
+    expect(profileNames()).toEqual(['Default', 'Racing']);
+    await poll(service);
+    expect(profileNames()).toEqual(['Default', 'Racing']);
+    await service.selectBridge(bridgeB.path);
+    expect(profileNames()).toEqual(['Default', 'Couch']);
+  });
+
   it('adopts the only connected bridge when the saved device path is stale', async () => {
     const stalePath = 'winusb://disconnected-waveshare';
     const currentPath = 'winusb://regular-pico';
@@ -2821,6 +3421,437 @@ describe('BridgeService', () => {
         name: 'Desk Bridge'
       })
     ]);
+  });
+
+  it('lists a hot-plugged bridge within Kitsune Input’s two-second census', async () => {
+    let now = 1_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const service = serviceFixture();
+      await poll(service);
+      expect(service.getSnapshot().bridgeDevices?.bridges).toEqual([]);
+
+      audioHelperMock.listBridges.mockResolvedValue({
+        bridges: [{ path: 'winusb://plugged-in', containerId: '11111111-1111-1111-1111-111111111111' }],
+        hidDevices: []
+      });
+      now += 1_500;
+      await poll(service);
+      expect(service.getSnapshot().bridgeDevices?.bridges).toEqual([]);
+
+      now += 500;
+      await poll(service);
+      expect(service.getSnapshot().bridgeDevices?.bridges).toEqual([
+        expect.objectContaining({ path: 'winusb://plugged-in', connected: false })
+      ]);
+
+      audioHelperMock.listBridges.mockResolvedValue({ bridges: [], hidDevices: [] });
+      now += 2_000;
+      await poll(service);
+      expect(service.getSnapshot().bridgeDevices?.bridges).toEqual([]);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('keeps the ten-second census while each census needs a helper process of its own', async () => {
+    let now = 1_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    censusClientMock.resident = false;
+    try {
+      const service = serviceFixture();
+      await poll(service);
+      audioHelperMock.listBridges.mockClear();
+
+      now += 2_000;
+      await poll(service);
+      expect(audioHelperMock.listBridges).not.toHaveBeenCalled();
+
+      now += 8_000;
+      await poll(service);
+      expect(audioHelperMock.listBridges).toHaveBeenCalledTimes(1);
+    } finally {
+      censusClientMock.resident = true;
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('lists a bridge with its name the moment its transport connects', async () => {
+    let now = 1_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const uniqueId = '0011223344556677';
+      const service = serviceFixture({
+        bridgeIdentities: { [uniqueId]: { label: 'Desk', containerId: '11111111-1111-1111-1111-111111111111' } }
+      });
+      await poll(service);
+      expect(service.getSnapshot().bridgeDevices?.bridges).toEqual([]);
+
+      // The bridge attaches between censuses and the transport finds it first.
+      const device = new MockHidDevice();
+      device.path = 'winusb://desk';
+      device.deviceIdentity = deviceIdentityReport({ bridgeId: uniqueId });
+      hidMock.state.devicesList = [companionDeviceInfo(device.path)];
+      hidMock.state.openDevices.set(device.path, device);
+      audioHelperMock.listBridges.mockResolvedValue({
+        bridges: [{ path: device.path, containerId: '11111111-1111-1111-1111-111111111111' }],
+        hidDevices: []
+      });
+      now += 500;
+      await poll(service);
+
+      expect(service.getSnapshot().state).toBe('connected');
+      expect(service.getSnapshot().bridgeDevices?.bridges).toEqual([
+        expect.objectContaining({ path: device.path, connected: true, selected: true, uniqueId, name: 'Desk' })
+      ]);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('switches to a listed bridge without waiting for a new census', async () => {
+    const service = serviceFixture();
+    audioHelperMock.listBridges.mockResolvedValue({
+      bridges: [
+        { path: 'winusb://bridge-a', containerId: '11111111-1111-1111-1111-111111111111' },
+        { path: 'winusb://bridge-b', containerId: '22222222-2222-2222-2222-222222222222' }
+      ],
+      hidDevices: []
+    });
+    await service.refreshBridgeDevices();
+    audioHelperMock.listBridges.mockClear();
+
+    await service.selectBridge('winusb://bridge-b');
+    expect(audioHelperMock.listBridges).not.toHaveBeenCalled();
+    expect(service.getSnapshot().settings.selectedBridgePath).toBe('winusb://bridge-b');
+
+    await expect(service.selectBridge('winusb://bridge-c')).rejects.toThrow('no longer connected');
+    expect(audioHelperMock.listBridges).toHaveBeenCalledTimes(1);
+  });
+
+  it('follows the selected bridge to its bridge-only path while another bridge is plugged in', async () => {
+    const desk = '0011223344556677';
+    const personaPath = 'winusb://vid_054c&pid_0ce6&mi_05#desk';
+    const bridgeOnlyPath = 'winusb://vid_1209&pid_db08&mi_01#desk';
+    const service = serviceFixture({
+      selectedBridgePath: personaPath,
+      selectedBridgeUniqueId: desk,
+      bridgeIdentities: {
+        [desk]: {
+          label: 'Desk',
+          containerId: '11111111-1111-1111-1111-111111111111',
+          containerIds: ['11111111-1111-1111-1111-111111111111', '11111111-0000-0000-0000-000000000000']
+        },
+        bbbbbbbbbbbbbbbb: { label: 'Couch', containerId: '22222222-2222-2222-2222-222222222222' }
+      }
+    });
+    const device = new MockHidDevice();
+    device.path = bridgeOnlyPath;
+    device.status = statusReport({ controllerConnected: false });
+    device.deviceIdentity = deviceIdentityReport({ bridgeId: desk });
+    const couch = new MockHidDevice();
+    couch.path = 'winusb://couch';
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set(couch.path, couch);
+    hidMock.state.openDevices.set(bridgeOnlyPath, device);
+    // The controller disconnected, so the bridge reattached as its bridge-only receiver.
+    audioHelperMock.listBridges.mockResolvedValue({
+      bridges: [
+        { path: couch.path, containerId: '22222222-2222-2222-2222-222222222222' },
+        { path: bridgeOnlyPath, containerId: '11111111-0000-0000-0000-000000000000' }
+      ],
+      hidDevices: []
+    });
+
+    await poll(service);
+
+    expect(winUsbTransportMock.open).toHaveBeenLastCalledWith(expect.objectContaining({ devicePath: bridgeOnlyPath }));
+    expect(service.getSnapshot()).toMatchObject({
+      state: 'connected',
+      // The bridge-only path is not saved: the next controller moves the bridge again.
+      settings: { selectedBridgePath: personaPath, selectedBridgeUniqueId: desk }
+    });
+    expect(service.getSnapshot().bridgeDevices?.bridges.map((bridge) => [bridge.name, bridge.selected])).toEqual([
+      ['Desk', true],
+      ['Couch', false]
+    ]);
+  });
+
+  it('remembers a bridge’s bridge-only container, so it keeps its name and rank while idle', async () => {
+    const desk = '0011223344556677';
+    const bridgeOnlyPath = 'winusb://vid_1209&pid_db08&mi_01#desk';
+    const service = serviceFixture({
+      bridgeIdentities: {
+        [desk]: { label: 'Desk', containerId: '11111111-1111-1111-1111-111111111111' },
+        bbbbbbbbbbbbbbbb: { label: 'Couch', containerId: '22222222-2222-2222-2222-222222222222' }
+      }
+    });
+    const device = new MockHidDevice();
+    device.path = bridgeOnlyPath;
+    device.status = statusReport({ controllerConnected: false });
+    device.deviceIdentity = deviceIdentityReport({ bridgeId: desk });
+    const couch = new MockHidDevice();
+    couch.path = 'winusb://couch';
+    couch.deviceIdentity = deviceIdentityReport({ bridgeId: 'bbbbbbbbbbbbbbbb' });
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set(bridgeOnlyPath, device);
+    hidMock.state.openDevices.set(couch.path, couch);
+    audioHelperMock.listBridges.mockResolvedValue({
+      bridges: [
+        { path: bridgeOnlyPath, containerId: '11111111-0000-0000-0000-000000000000' },
+        { path: couch.path, containerId: '22222222-2222-2222-2222-222222222222' }
+      ],
+      hidDevices: []
+    });
+
+    await service.selectBridge(bridgeOnlyPath);
+    await poll(service);
+    expect(service.getSnapshot().settings.bridgeIdentities[desk]).toEqual({
+      label: 'Desk',
+      containerId: '11111111-1111-1111-1111-111111111111',
+      containerIds: ['11111111-1111-1111-1111-111111111111', '11111111-0000-0000-0000-000000000000']
+    });
+
+    await service.selectBridge(couch.path);
+    await poll(service);
+    expect(service.getSnapshot().bridgeDevices?.bridges.map((bridge) => [bridge.name, bridge.connected])).toEqual([
+      ['Desk', false],
+      ['Couch', true]
+    ]);
+  });
+
+  describe('when a controller switch re-enumerates the selected bridge', () => {
+    const waveShare = 'c7a9c48819b4825a';
+    const pico = 'b06621e46c7ecbd1';
+    const oldPersonaPath = 'winusb://vid_054c&pid_0ce6&mi_05#8&1fb63bb6&0&7';
+    const newPersonaPath = 'winusb://vid_054c&pid_0df2&mi_05#8&1fb63bb6&0&7';
+    const picoBridgeOnlyPath = 'winusb://vid_1209&pid_db08&mi_01#9&2c29198e&0&0001';
+    const picoPersonaPath = 'winusb://vid_054c&pid_0ce6&mi_05#8&2aa0c1d2&0&3';
+
+    function twoBridgeService() {
+      return serviceFixture({
+        selectedBridgePath: oldPersonaPath,
+        selectedBridgeUniqueId: waveShare,
+        bridgeIdentities: {
+          [waveShare]: { label: 'WaveShare', containerId: '11111111-1111-1111-1111-111111111111' },
+          [pico]: { label: 'Pico 2W', containerId: '22222222-2222-2222-2222-222222222222' }
+        }
+      });
+    }
+
+    function bridge(path: string, bridgeId: string): MockHidDevice {
+      const device = new MockHidDevice();
+      device.path = path;
+      device.deviceIdentity = deviceIdentityReport({ bridgeId });
+      hidMock.state.openDevices.set(path, device);
+      return device;
+    }
+
+    it('reconnects to the same bridge under its new PID and keeps both names', async () => {
+      const service = twoBridgeService();
+      bridge(newPersonaPath, waveShare);
+      const picoDevice = bridge(picoBridgeOnlyPath, pico);
+      hidMock.state.devicesList = [companionDeviceInfo()];
+      // A DualSense Edge now: a container no identity has recorded. The Pico
+      // 2W idles as its bridge-only receiver, whose USB serial is its ID.
+      audioHelperMock.listBridges.mockResolvedValue({
+        bridges: [
+          { path: picoBridgeOnlyPath, containerId: '22222222-0000-0000-0000-000000000000', uniqueId: pico },
+          { path: newPersonaPath, containerId: '33333333-3333-3333-3333-333333333333' }
+        ],
+        hidDevices: []
+      });
+
+      await poll(service);
+
+      expect(winUsbTransportMock.open).toHaveBeenLastCalledWith(expect.objectContaining({ devicePath: newPersonaPath }));
+      expect(winUsbTransportMock.open).not.toHaveBeenCalledWith(expect.objectContaining({ devicePath: oldPersonaPath }));
+      expect(picoDevice.featureReportIds).toEqual([]);
+      const snapshot = service.getSnapshot();
+      expect(snapshot.state).toBe('connected');
+      expect(snapshot.settings).toMatchObject({ selectedBridgePath: newPersonaPath, selectedBridgeUniqueId: waveShare });
+      expect(snapshot.settings.bridgeIdentities[waveShare]?.containerIds)
+        .toContain('33333333-3333-3333-3333-333333333333');
+      expect(snapshot.bridgeDevices?.bridges.map((row) => [row.name, row.connected, row.selected])).toEqual([
+        ['WaveShare', true, true],
+        ['Pico 2W', false, false]
+      ]);
+    });
+
+    it('checks an unknown bridge’s ID before sending it anything, and names it if it is the other one', async () => {
+      const service = twoBridgeService();
+      const picoDevice = bridge(picoPersonaPath, pico);
+      bridge(newPersonaPath, waveShare);
+      hidMock.state.devicesList = [companionDeviceInfo()];
+      // Both bridges are on containers no identity has recorded yet.
+      audioHelperMock.listBridges.mockResolvedValue({
+        bridges: [
+          { path: picoPersonaPath, containerId: '44444444-4444-4444-4444-444444444444' },
+          { path: newPersonaPath, containerId: '33333333-3333-3333-3333-333333333333' }
+        ],
+        hidDevices: []
+      });
+
+      await poll(service);
+
+      // The Pico 2W was opened only to read its ID: no settings, then closed.
+      expect(picoDevice.featureReportIds).toEqual([REPORT_ID.STATUS, REPORT_ID.DEVICE_IDENTITY]);
+      expect(picoDevice.sentReports).toEqual([]);
+      expect(picoDevice.closeCount).toBe(1);
+      expect(service.getSnapshot().state).toBe('no-bridge');
+      expect(service.getSnapshot().settings.bridgeIdentities[pico]?.containerIds)
+        .toContain('44444444-4444-4444-4444-444444444444');
+
+      await poll(service);
+
+      expect(winUsbTransportMock.open).toHaveBeenLastCalledWith(expect.objectContaining({ devicePath: newPersonaPath }));
+      expect(service.getSnapshot().state).toBe('connected');
+      expect(service.getSnapshot().bridgeDevices?.bridges.map((row) => [row.name, row.connected])).toEqual([
+        ['WaveShare', true],
+        ['Pico 2W', false]
+      ]);
+    });
+
+    it('opens nothing, and does not report normal firmware, while the selected bridge is unplugged', async () => {
+      const service = twoBridgeService();
+      bridge(picoBridgeOnlyPath, pico);
+      const other = bridge('winusb://other', 'dddddddddddddddd');
+      hidMock.state.devicesList = [normalFirmwareDeviceInfo()];
+      audioHelperMock.listBridges.mockResolvedValue({
+        bridges: [
+          { path: picoBridgeOnlyPath, containerId: '22222222-0000-0000-0000-000000000000', uniqueId: pico },
+          { path: other.path, containerId: null, uniqueId: 'dddddddddddddddd' }
+        ],
+        hidDevices: []
+      });
+
+      await poll(service);
+      await poll(service);
+
+      expect(winUsbTransportMock.open).not.toHaveBeenCalled();
+      expect(service.getSnapshot()).toMatchObject({
+        state: 'no-bridge',
+        settings: { selectedBridgePath: oldPersonaPath, selectedBridgeUniqueId: waveShare }
+      });
+      expect(service.getSnapshot().bridgeDevices?.bridges.map((row) => [row.name, row.selected])).toEqual([
+        ['Pico 2W', false],
+        [null, false]
+      ]);
+    });
+
+    describe('while it leaves USB for a moment', () => {
+      const xboxPersonaPath = 'winusb://vid_1209&pid_db05&mi_05#8&1fb63bb6&0&7';
+      const picoRow = { path: picoBridgeOnlyPath, containerId: '22222222-0000-0000-0000-000000000000', uniqueId: pico };
+      let clock = 1_000_000;
+
+      beforeEach(() => {
+        clock = 1_000_000;
+        vi.spyOn(Date, 'now').mockImplementation(() => clock);
+      });
+
+      afterEach(() => {
+        vi.mocked(Date.now).mockRestore();
+      });
+
+      /** The WaveShare connected on its DualSense persona, the Pico 2W idle beside it. */
+      async function connectedWaveShare() {
+        const service = twoBridgeService();
+        const waveShareDevice = bridge(oldPersonaPath, waveShare);
+        waveShareDevice.status = statusReport({
+          controllerConnected: true,
+          hostPersonaMode: 'dualsense',
+          supportedHostPersonaModesMask: 0x0f
+        });
+        const picoDevice = bridge(picoBridgeOnlyPath, pico);
+        hidMock.state.devicesList = [companionDeviceInfo()];
+        audioHelperMock.listBridges.mockResolvedValue({
+          bridges: [picoRow, { path: oldPersonaPath, containerId: '11111111-1111-1111-1111-111111111111' }],
+          hidDevices: []
+        });
+        await poll(service);
+        expect(service.getSnapshot().state).toBe('connected');
+        return { service, waveShareDevice, picoDevice };
+      }
+
+      /** The WaveShare leaves USB; for a moment the census lists only the Pico 2W. */
+      async function waveShareLeaves(waveShareDevice: MockHidDevice) {
+        audioHelperMock.listBridges.mockResolvedValue({ bridges: [picoRow], hidDevices: [] });
+        hidMock.state.openDevices.delete(oldPersonaPath);
+        waveShareDevice.emit('close');
+        await flushImmediate();
+      }
+
+      it('keeps the selection through a persona switch and finds the bridge on its new path', async () => {
+        const { service, waveShareDevice, picoDevice } = await connectedWaveShare();
+        await service.setHostPersonaMode('xbox');
+        await waveShareLeaves(waveShareDevice);
+
+        clock += 3000;
+        await poll(service);
+
+        expect(service.getSnapshot().settings).toMatchObject({ selectedBridgeUniqueId: waveShare });
+        expect(picoDevice.featureReportIds).toEqual([]);
+
+        // It comes back as the Xbox persona, on a container no identity records.
+        const xboxDevice = bridge(xboxPersonaPath, waveShare);
+        xboxDevice.status = statusReport({
+          controllerConnected: true,
+          hostPersonaMode: 'xbox',
+          supportedHostPersonaModesMask: 0x0f
+        });
+        audioHelperMock.listBridges.mockResolvedValue({
+          bridges: [picoRow, { path: xboxPersonaPath, containerId: '55555555-5555-5555-5555-555555555555' }],
+          hidDevices: []
+        });
+        clock += 3000;
+        await poll(service);
+
+        expect(service.getSnapshot()).toMatchObject({
+          state: 'connected',
+          settings: { selectedBridgePath: xboxPersonaPath, selectedBridgeUniqueId: waveShare }
+        });
+        expect(service.getSnapshot().status?.hostPersonaMode).toBe('xbox');
+        expect(picoDevice.featureReportIds).toEqual([]);
+        expect(service.getSnapshot().bridgeDevices?.bridges.map((row) => [row.name, row.connected, row.selected])).toEqual([
+          ['WaveShare', true, true],
+          ['Pico 2W', false, false]
+        ]);
+      });
+
+      it('does not reopen the persona the bridge is leaving while a switch is in flight', async () => {
+        const { service, waveShareDevice } = await connectedWaveShare();
+        await service.setHostPersonaMode('xbox');
+        // The transport drops, but this census still lists the old DualSense path.
+        waveShareDevice.emit('close');
+        await flushImmediate();
+        vi.mocked(winUsbTransportMock.open).mockClear();
+
+        clock += 300;
+        await poll(service);
+
+        expect(winUsbTransportMock.open).not.toHaveBeenCalledWith(expect.objectContaining({ devicePath: oldPersonaPath }));
+        expect(service.getSnapshot()).toMatchObject({ state: 'transitioning', settings: { selectedBridgeUniqueId: waveShare } });
+      });
+
+      it('waits out a controller swap before letting the other bridge take the selection', async () => {
+        const { service, waveShareDevice } = await connectedWaveShare();
+        await waveShareLeaves(waveShareDevice);
+
+        clock += 3000;
+        await poll(service);
+        clock += 3000;
+        await poll(service);
+        expect(service.getSnapshot().settings.selectedBridgeUniqueId).toBe(waveShare);
+
+        // Gone for good: past the grace period, the only bridge left is selected.
+        clock += 10000;
+        await poll(service);
+        expect(service.getSnapshot().settings).toMatchObject({
+          selectedBridgePath: picoBridgeOnlyPath,
+          selectedBridgeUniqueId: pico
+        });
+      });
+    });
   });
 
   it('rejects bridge paths and identities that were not enumerated', async () => {
@@ -2949,14 +3980,24 @@ describe('BridgeService', () => {
 
     snapshot = await service.setNotifyLowBattery(true);
     expect(snapshot.settings.notifyLowBattery).toBe(true);
+
+    snapshot = await service.setNotifyPersonaChange(false);
+    expect(snapshot.settings.notifyPersonaChange).toBe(false);
+
+    snapshot = await service.setNotifyMicMute(true);
+    expect(snapshot.settings.notifyMicMute).toBe(true);
   });
 
-  it('stores permanent Kitsune Input promotion dismissal without firmware traffic', () => {
+  it('marks the one-time Kitsune Input offer shown and tells the renderer', () => {
     const service = serviceFixture();
+    const emitted: boolean[] = [];
+    service.on('snapshot', (snapshot: { settings: { kitsuneInputLaunchOfferShown: boolean } }) => {
+      emitted.push(snapshot.settings.kitsuneInputLaunchOfferShown);
+    });
 
-    const snapshot = service.setKitsuneInputPromotionDismissed(true);
-
-    expect(snapshot.settings.kitsuneInputPromotionDismissed).toBe(true);
+    expect(service.getSnapshot().settings.kitsuneInputLaunchOfferShown).toBe(false);
+    expect(service.markKitsuneInputLaunchOfferShown().settings.kitsuneInputLaunchOfferShown).toBe(true);
+    expect(emitted).toEqual([true]);
   });
 
   it('emits controller connect and disconnect toasts on status transitions', async () => {
@@ -2974,12 +4015,76 @@ describe('BridgeService', () => {
 
     device.status = statusReport({ controllerConnected: true, uptimeSeconds: 11 });
     await poll(service);
-    expect(toasts.at(-1)?.body).toBe('Controller connected');
+    expect(toasts).toEqual([]);
+    await poll(service);
+    // The status fixture reports a charging controller.
+    expect(toasts.at(-1)?.body).toBe('Controller connected — battery 78% (charging)');
 
     device.status = statusReport({ controllerConnected: false, uptimeSeconds: 12 });
     await poll(service);
     expect(toasts.at(-1)?.body).toBe('Controller disconnected');
     expect(toasts).toHaveLength(2);
+  });
+
+  it('ignores the battery level on the poll that first sees a reconnect', async () => {
+    const service = serviceFixture();
+    const device = new MockHidDevice();
+    device.status = statusReport({ controllerConnected: false });
+    const toasts: Array<{ title: string; body: string }> = [];
+    service.on('toast', (toast) => toasts.push(toast));
+    await service.setNotifyControllerConnection(true);
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set('companion-path', device);
+    await poll(service);
+
+    // The bridge still holds the report from before the disconnect.
+    device.status = statusReport({ controllerConnected: true, batteryPercent: 5, uptimeSeconds: 11 });
+    await poll(service);
+    expect(toasts).toEqual([]);
+
+    device.status = statusReport({ controllerConnected: true, batteryPercent: 64, uptimeSeconds: 12 });
+    await poll(service);
+    expect(toasts.map((toast) => toast.body)).toEqual(['Controller connected — battery 64% (charging)']);
+  });
+
+  it('holds the connect toast briefly for the first battery level', async () => {
+    const service = serviceFixture();
+    const device = new MockHidDevice();
+    device.status = statusReport({ controllerConnected: false });
+    const toasts: Array<{ title: string; body: string }> = [];
+    service.on('toast', (toast) => toasts.push(toast));
+    await service.setNotifyControllerConnection(true);
+    hidMock.state.devicesList = [companionDeviceInfo()];
+    hidMock.state.openDevices.set('companion-path', device);
+    await poll(service);
+
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    try {
+      device.status = statusReport({ controllerConnected: true, batteryPercent: 255, uptimeSeconds: 11 });
+      await poll(service);
+      expect(toasts).toEqual([]);
+
+      device.status = statusReport({ controllerConnected: true, batteryPercent: 64, uptimeSeconds: 12 });
+      nowSpy.mockReturnValue(1_001_000);
+      await poll(service);
+      expect(toasts.map((toast) => toast.body)).toEqual(['Controller connected — battery 64% (charging)']);
+
+      // A battery level that never arrives does not hold the toast back for good.
+      device.status = statusReport({ controllerConnected: false, uptimeSeconds: 13 });
+      await poll(service);
+      device.status = statusReport({ controllerConnected: true, batteryPercent: 255, uptimeSeconds: 14 });
+      await poll(service);
+      expect(toasts).toHaveLength(2);
+      nowSpy.mockReturnValue(1_004_001);
+      await poll(service);
+      expect(toasts.map((toast) => toast.body)).toEqual([
+        'Controller connected — battery 64% (charging)',
+        'Controller disconnected',
+        'Controller connected'
+      ]);
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 
   it('emits controller toasts when the companion interface disappears and returns', async () => {
@@ -3002,7 +4107,8 @@ describe('BridgeService', () => {
     device.status = statusReport({ controllerConnected: true, uptimeSeconds: 1 });
     hidMock.state.devicesList = [companionDeviceInfo()];
     await poll(service);
-    expect(toasts.at(-1)?.body).toBe('Controller connected');
+    await poll(service);
+    expect(toasts.at(-1)?.body).toBe('Controller connected — battery 78% (charging)');
     expect(toasts).toHaveLength(2);
   });
 

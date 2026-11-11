@@ -4,6 +4,10 @@ import { describe, expect, it } from 'vitest';
 const preloadSource = readFileSync(new URL('../preload.ts', import.meta.url), 'utf8');
 const mainSource = readFileSync(new URL('./main.ts', import.meta.url), 'utf8');
 const bridgeServiceSource = readFileSync(new URL('./bridge-service.ts', import.meta.url), 'utf8');
+const bootloaderCoordinatorSource = readFileSync(
+  new URL('./pico-bootloader-authorization-coordinator.ts', import.meta.url),
+  'utf8'
+);
 const packageSource = readFileSync(new URL('../../package.json', import.meta.url), 'utf8');
 const packageWinSource = readFileSync(new URL('../../scripts/package-win.mjs', import.meta.url), 'utf8');
 
@@ -52,6 +56,9 @@ describe('IPC contract', () => {
     expect(mainSource).toContain('/^https:\\/\\/github\\.com\\/SundayMoments\\/?$/i.test(url)');
     expect(mainSource).toContain('/^https:\\/\\/discord\\.gg\\/By5jhh73wr\\/?$/i.test(url)');
     expect(mainSource).toContain('/^https:\\/\\/kitsuneinput\\.com\\/?$/i.test(url)');
+    // The Kitsune Input prompts' tagged links.
+    expect(mainSource).toContain('/^https:\\/\\/kitsuneinput\\.com\\/\\?src=ds5-popup$/i.test(url)');
+    expect(mainSource).toContain('/^https:\\/\\/kitsuneinput\\.com\\/buy\\?src=ds5-popup$/i.test(url)');
   });
 
   it('maps chord keyboard shortcuts to Windows virtual-key codes', () => {
@@ -79,7 +86,23 @@ describe('IPC contract', () => {
     expect(mainSource).toContain('function runPicoFirmwareIpcAction(');
     expect(mainSource).toContain("return 'No companion bridge is connected. Connect the companion bridge, then try again.';");
     expect(bridgeServiceSource).toContain('async mountPicoBootloader(): Promise<void>');
-    expect(bridgeServiceSource).toContain('COMMAND_ID.ENTER_BOOTLOADER');
+    expect(bridgeServiceSource).toContain('new PicoBootloaderAuthorizationCoordinator(');
+    expect(bootloaderCoordinatorSource).toContain('COMMAND_ID.ENTER_BOOTLOADER');
+    expect(preloadSource).toContain("ipcRenderer.invoke('bridge:cancelBootloaderConfirmation')");
+    expect(mainSource).toContain("ipcMain.handle('bridge:cancelBootloaderConfirmation'");
+    expect(mainSource).toContain("new BootloaderAuthorizationStore(app.getPath('userData'), safeStorage)");
+  });
+
+  it('exposes Wake-on-LAN through result-wrapped channels', () => {
+    for (const channel of [
+      'getWakeOnLan', 'getWakeOnLanTargets', 'getWakeOnLanReadiness', 'configureWakeOnLan',
+      'setWakeOnLanEnabled', 'forgetWakeOnLan', 'cancelWakeOnLan'
+    ]) {
+      expect(preloadSource).toContain(`ipcRenderer.invoke('bridge:${channel}'`);
+      expect(mainSource).toMatch(new RegExp(`ipcMain\\.handle\\('bridge:${channel}', [^\\n]*wakeOnLanResult`));
+    }
+    // The sandboxed preload may only require electron.
+    expect(preloadSource).not.toMatch(/^import (?!type)[^;]*from '\.\/shared/m);
   });
 
   it('exposes controller scan and pairing deletion actions', () => {
@@ -128,8 +151,8 @@ describe('IPC contract', () => {
     expect(bridgeServiceSource).toContain('setShowBatteryPercentTrayIcon(enabled: boolean): BridgeSnapshot');
     expect(mainSource).toContain('function batteryTrayIcon(');
     expect(mainSource).toContain('snapshot.settings.showBatteryPercentTrayIcon');
-    expect(mainSource).toContain('TRAY_BATTERY_ICON_DISCHARGING');
-    expect(mainSource).toContain('TRAY_BATTERY_ICON_EXTERNAL_POWER');
+    expect(mainSource).toContain("const powered = powerState !== 'battery';");
+    expect(mainSource).toContain('createTrayBatteryIconBuffer(clampedPercent, powered)');
     expect(mainSource).toContain("if (rawPowerState === 0x01) return 'charging';");
     expect(mainSource).toContain("if (rawPowerState === 0x02) return 'external-power';");
   });

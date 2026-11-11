@@ -2,6 +2,12 @@
 
 #include "dualsense_output.h"
 
+#if __has_include("pico.h")
+#include "pico.h"
+#else
+#define __not_in_flash_func(name) name
+#endif
+
 using namespace ds5::output;
 
 namespace {
@@ -10,6 +16,7 @@ uint16_t classic_rumble_gain_percent = 100;
 bool classic_rumble_v1_enabled = false;
 bool audio_haptics_replace_requested = false;
 bool audio_haptics_replace_producer_active = false;
+uint32_t audio_haptics_replace_producer_last_frame_us = 0;
 
 bool audio_haptics_replace_active() {
     return audio_haptics_replace_requested && audio_haptics_replace_producer_active;
@@ -37,11 +44,33 @@ void controller_output_policy_set_audio_haptics_replace_requested(bool requested
     audio_haptics_replace_requested = requested;
 }
 
-void controller_output_policy_set_audio_haptics_replace_producer_active(bool active) {
-    audio_haptics_replace_producer_active = active;
+// Called per producer frame from the SRAM USB audio path.
+bool __not_in_flash_func(controller_output_policy_note_audio_haptics_producer_frame)(uint32_t now_us) {
+    const bool activated = !audio_haptics_replace_producer_active;
+    audio_haptics_replace_producer_active = true;
+    audio_haptics_replace_producer_last_frame_us = now_us;
+    return activated;
 }
 
-bool controller_output_policy_audio_haptics_replace_active() {
+bool controller_output_policy_poll_audio_haptics_producer(uint32_t now_us) {
+    if (
+        !audio_haptics_replace_producer_active
+        || static_cast<uint32_t>(
+            now_us - audio_haptics_replace_producer_last_frame_us
+        ) < kAudioHapticsProducerLeaseTimeoutUs
+    ) {
+        return false;
+    }
+    controller_output_policy_reset_audio_haptics_producer();
+    return true;
+}
+
+void controller_output_policy_reset_audio_haptics_producer() {
+    audio_haptics_replace_producer_active = false;
+    audio_haptics_replace_producer_last_frame_us = 0;
+}
+
+bool __not_in_flash_func(controller_output_policy_audio_haptics_replace_active)() {
     return audio_haptics_replace_active();
 }
 
@@ -71,6 +100,41 @@ bool controller_output_policy_apply_classic_rumble_gain_payload(uint8_t *payload
 
     const uint8_t right = payload[kMotorRightOffset];
     const uint8_t left = payload[kMotorLeftOffset];
+    if (audio_haptics_replace_active()) {
+        // Replace makes live Audio Haptics the only actuator owner: strip the
+        // rumble mode flags and motors and leave every other field to the host.
+        bool changed = false;
+        const uint8_t next_flag0 = static_cast<uint8_t>(
+            flag0 & static_cast<uint8_t>(~(
+                kFlag0CompatibleVibration | kFlag0HapticsSelect
+            ))
+        );
+        if (payload[kValidFlag0Offset] != next_flag0) {
+            payload[kValidFlag0Offset] = next_flag0;
+            changed = true;
+        }
+        if (len > kValidFlag2Offset) {
+            const uint8_t next_flag2 = static_cast<uint8_t>(
+                flag2 & static_cast<uint8_t>(~(
+                    kFlag2EnableImprovedRumbleEmulation | kFlag2UseRumbleNotHaptics2
+                ))
+            );
+            if (payload[kValidFlag2Offset] != next_flag2) {
+                payload[kValidFlag2Offset] = next_flag2;
+                changed = true;
+            }
+        }
+        if (right != 0) {
+            payload[kMotorRightOffset] = 0;
+            changed = true;
+        }
+        if (left != 0) {
+            payload[kMotorLeftOffset] = 0;
+            changed = true;
+        }
+        return changed;
+    }
+
     payload[kMotorRightOffset] = controller_output_policy_scale_classic_rumble_byte(right);
     payload[kMotorLeftOffset] = controller_output_policy_scale_classic_rumble_byte(left);
     return payload[kMotorRightOffset] != right || payload[kMotorLeftOffset] != left;
@@ -320,25 +384,31 @@ bool controller_output_policy_sanitize_host_lightbar_payload(
     return changed;
 }
 
-bool controller_output_policy_host_output_clears_leds(uint8_t const *payload, uint16_t len) {
+// Restoring the saved color is for a lightbar the game released or blanked.
+// Player indicator changes leave the game's lightbar color alone; counting
+// them overwrote a game's color 250 ms after it turned the player LEDs off.
+bool controller_output_policy_host_output_clears_lightbar(uint8_t const *payload, uint16_t len) {
     if (payload == nullptr || len <= kValidFlag1Offset) {
         return false;
     }
 
-    const uint8_t led_flags = payload[kValidFlag1Offset] & kHostLedControlMask;
-    if (led_flags == 0) {
-        return false;
-    }
-
     const bool releases_leds = (payload[kValidFlag1Offset] & kFlag1ReleaseLeds) != 0;
-    const bool clears_player_indicator = (payload[kValidFlag1Offset] & kFlag1PlayerIndicatorControlEnable) != 0
-        && len > kPlayerLedsOffset
-        && payload[kPlayerLedsOffset] == 0;
     const bool clears_lightbar = (payload[kValidFlag1Offset] & kFlag1LightbarControlEnable) != 0
         && len > kLightbarBlueOffset
         && payload[kLightbarRedOffset] == 0
         && payload[kLightbarGreenOffset] == 0
         && payload[kLightbarBlueOffset] == 0;
 
-    return releases_leds || clears_player_indicator || clears_lightbar;
+    return releases_leds || clears_lightbar;
+}
+
+bool controller_output_policy_host_output_sets_lightbar(uint8_t const *payload, uint16_t len) {
+    if (payload == nullptr || len <= kLightbarBlueOffset) {
+        return false;
+    }
+
+    const uint8_t flags = payload[kValidFlag1Offset];
+    return (flags & kFlag1LightbarControlEnable) != 0
+        && (flags & kFlag1ReleaseLeds) == 0
+        && (payload[kLightbarRedOffset] | payload[kLightbarGreenOffset] | payload[kLightbarBlueOffset]) != 0;
 }

@@ -23,11 +23,43 @@ describe('main window behavior', () => {
       showWindowCentered.indexOf('const display = screen.getPrimaryDisplay();')
     );
 
-    expect(mainSource).toContain("mainWindow.on('show', () => scheduleMainWindowScaleRestore(false));");
-    expect(mainSource).toContain("mainWindow.on('restore', () => scheduleMainWindowScaleRestore(false));");
-    expect(mainSource).toContain("mainWindow.on('focus', () => scheduleMainWindowScaleRestore(false));");
+    const ensureMainWindow = extractFunction('ensureMainWindow');
+    expect(ensureMainWindow).toMatch(/window\.on\('show', \(\) => \{[^}]*scheduleMainWindowScaleRestore\(false\);/);
+    expect(ensureMainWindow).toMatch(/window\.on\('restore', \(\) => \{[^}]*scheduleMainWindowScaleRestore\(false\);/);
+    expect(ensureMainWindow).toContain("window.on('focus', () => scheduleMainWindowScaleRestore(false));");
     expect(mainSource).toContain("powerMonitor.on('resume', () => scheduleMainWindowScaleRestore(true));");
     expect(mainSource).toContain("powerMonitor.on('unlock-screen', () => scheduleMainWindowScaleRestore(true));");
     expect(mainSource).toContain("screen.on('display-metrics-changed', () => scheduleMainWindowScaleRestore(true));");
+  });
+
+  it('hides the window on close unless the user chose to quit there', () => {
+    const closeMainWindow = extractFunction('closeMainWindow');
+    expect(closeMainWindow).toContain('snapshot?.settings.closeButtonQuits');
+    expect(closeMainWindow.indexOf('app.quit();')).toBeLessThan(closeMainWindow.indexOf('window?.hide();'));
+    // A firmware action or bootloader confirmation in flight only hides, so a
+    // UF2 copy is never cut short.
+    expect(closeMainWindow).toContain('mainWindowBusyTasks === 0');
+    expect(closeMainWindow).toContain('!snapshot.bootloaderConfirmation');
+    expect(extractFunction('createWindow')).toMatch(/window\.on\('close', \(event\) => \{\s*if \(!isQuitting\) \{\s*event\.preventDefault\(\);\s*closeMainWindow\(window\);/);
+    expect(mainSource).toContain("ipcMain.handle('window:hide', () => closeMainWindow(mainWindow));");
+    expect(mainSource).toContain("ipcMain.handle('bridge:setCloseButtonQuits'");
+  });
+
+  it('creates the window on demand and releases it after it stays hidden', () => {
+    // A tray start creates no renderer; the tray Open item creates it.
+    expect(mainSource).toMatch(/if \(!shouldStartInTray\(\)\) \{\s*showWindowCentered\(\);/);
+    const showWindowCentered = extractFunction('showWindowCentered');
+    expect(showWindowCentered).toContain('mainWindowShowPending = true;');
+    expect(showWindowCentered).toContain('ensureMainWindow();');
+    const ensureMainWindow = extractFunction('ensureMainWindow');
+    expect(ensureMainWindow).toContain("window.on('hide', () => scheduleMainWindowRetirement());");
+    expect(ensureMainWindow).toContain("sendToMainWindow('bridge:snapshot', bridgeService.getSnapshot());");
+    const retire = extractFunction('retireHiddenMainWindow');
+    // Never under a firmware action or a pending controller confirmation.
+    expect(retire).toContain('mainWindowBusyTasks > 0');
+    expect(retire).toContain('bootloaderConfirmation');
+    expect(retire.indexOf('mainWindow = null;')).toBeLessThan(retire.indexOf('window.destroy();'));
+    // Snapshots go only to a visible window.
+    expect(mainSource).toMatch(/if \(mainWindow\?\.isVisible\(\)\) \{\s*sendToMainWindow\('bridge:snapshot', snapshot\);/);
   });
 });

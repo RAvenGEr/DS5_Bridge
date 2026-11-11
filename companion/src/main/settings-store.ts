@@ -40,7 +40,17 @@ import type {
   HostPersonaMode,
   RemapButtonId
 } from '../shared/protocol';
-import type { CompanionSettings, UiScalePercent, UiThemePreset } from '../shared/types';
+import { isUiScalePercent, isUiTextScalePercent } from '../shared/types';
+import { isUiThemePreset } from '../shared/ui-theme';
+import { SYSTEM_UI_LOCALE, normalizeUiLocalePreference } from '../shared/ui-locale-matching';
+export { normalizeUiLocalePreference };
+import type { BridgeWorkspace, CompanionSettings, UiScalePercent, UiTextScalePercent, UiThemePreset } from '../shared/types';
+import {
+  captureBridgeWorkspace,
+  isBridgeWorkspaceKey,
+  saveSelectedBridgeWorkspace,
+  transitionBridgeWorkspace
+} from './settings-bridge-workspaces';
 
 const DEFAULT_CONTROLLER_PROFILE_SETTINGS: ControllerProfileSettings = {
   leftStickRadialDeadzonePercent: 0,
@@ -148,10 +158,14 @@ const CONTROLLER_PROFILE_SETTING_KEYS = new Set<keyof ControllerProfileSettings>
 export const DEFAULT_SETTINGS: CompanionSettings = {
   selectedPresetId: 'balanced',
   uiScalePercent: 100,
+  uiTextScalePercent: 100,
   uiThemePreset: 'dark',
+  uiLocale: SYSTEM_UI_LOCALE,
   launchAtStartupEnabled: false,
   showBatteryPercentTrayIcon: false,
+  closeButtonQuits: false,
   kitsuneInputPromotionDismissed: false,
+  kitsuneInputLaunchOfferShown: false,
   firmwareLogDirectory: null,
   leftStickRadialDeadzonePercent: DEFAULT_CONTROLLER_PROFILE_SETTINGS.leftStickRadialDeadzonePercent,
   rightStickRadialDeadzonePercent: DEFAULT_CONTROLLER_PROFILE_SETTINGS.rightStickRadialDeadzonePercent,
@@ -171,7 +185,9 @@ export const DEFAULT_SETTINGS: CompanionSettings = {
   speakerVolumePercent: DEFAULT_CONTROLLER_PROFILE_SETTINGS.speakerVolumePercent,
   speakerGainLevel: 4,
   selectedBridgePath: null,
+  selectedBridgeUniqueId: null,
   bridgeIdentities: {},
+  bridgeWorkspaces: {},
   controllerBindings: {},
   micVolumePercent: DEFAULT_CONTROLLER_PROFILE_SETTINGS.micVolumePercent,
   micMuted: DEFAULT_CONTROLLER_PROFILE_SETTINGS.micMuted,
@@ -206,6 +222,8 @@ export const DEFAULT_SETTINGS: CompanionSettings = {
   hostPersonaMode: 'dualsense',
   notifyControllerConnection: false,
   notifyLowBattery: false,
+  notifyPersonaChange: true,
+  notifyMicMute: false,
   duplexMicEnabled: DEFAULT_CONTROLLER_PROFILE_SETTINGS.duplexMicEnabled,
   controllerPowerSavingEnabled: DEFAULT_CONTROLLER_PROFILE_SETTINGS.controllerPowerSavingEnabled,
   selectedControllerProfileId: DEFAULT_CONTROLLER_PROFILE_ID,
@@ -333,20 +351,33 @@ function normalizeAudioReactiveHapticsRelease(value: unknown): AudioReactiveHapt
 }
 
 export function normalizeUiScalePercent(value: unknown): UiScalePercent {
-  return value === 75 || value === 125 || value === 150 ? value : 100;
+  return isUiScalePercent(value) ? value : DEFAULT_SETTINGS.uiScalePercent;
+}
+
+export function normalizeUiTextScalePercent(value: unknown): UiTextScalePercent {
+  return isUiTextScalePercent(value) ? value : DEFAULT_SETTINGS.uiTextScalePercent;
+}
+
+/**
+ * Schema 4 and earlier zoomed the window by the raw percentage. Schema 5 adds a
+ * 1.25 base zoom, so each saved choice maps to the option with the same size.
+ */
+const LEGACY_UI_SCALE_PERCENTS: Readonly<Record<number, UiScalePercent>> = {
+  75: 60,
+  100: 80,
+  125: 100,
+  150: 120
+};
+
+export function migrateLegacyUiScalePercent(value: unknown): UiScalePercent {
+  // The legacy default was 100%, which keeps its size at 80%.
+  return typeof value === 'number' && LEGACY_UI_SCALE_PERCENTS[value] !== undefined
+    ? LEGACY_UI_SCALE_PERCENTS[value]
+    : LEGACY_UI_SCALE_PERCENTS[100];
 }
 
 export function normalizeUiThemePreset(value: unknown): UiThemePreset {
-  switch (value) {
-    case 'light':
-    case 'dark':
-    case 'bubble-gum':
-    case 'pomegranate':
-    case 'kiwi':
-      return value;
-    default:
-      return DEFAULT_SETTINGS.uiThemePreset;
-  }
+  return isUiThemePreset(value) ? value : DEFAULT_SETTINGS.uiThemePreset;
 }
 
 function cloneRemapMap(map: ButtonRemapMap): ButtonRemapMap {
@@ -655,6 +686,7 @@ const CHORD_CONTROLLER_SETTING_ACTIONS = new Set<ChordControllerSettingAction>([
   'toggle-lightbar-override',
   'toggle-mic-mute',
   'sleep-controller',
+  'show-battery',
   'persona-dualsense',
   'persona-dualsense-edge',
   'persona-ds4',
@@ -834,8 +866,12 @@ function cloneSettings(settings: CompanionSettings): CompanionSettings {
   return {
     ...settings,
     bridgeIdentities: Object.fromEntries(
-      Object.entries(settings.bridgeIdentities).map(([uniqueId, identity]) => [uniqueId, { ...identity }])
+      Object.entries(settings.bridgeIdentities).map(([uniqueId, identity]) => [uniqueId, {
+        ...identity,
+        ...(identity.containerIds ? { containerIds: [...identity.containerIds] } : {})
+      }])
     ),
+    bridgeWorkspaces: structuredClone(settings.bridgeWorkspaces),
     controllerBindings: { ...settings.controllerBindings },
     controllerProfiles: settings.controllerProfiles.map((profile) => ({
       ...profile,
@@ -856,7 +892,8 @@ type PersistedSettings = Partial<CompanionSettings> & {
   settingsSchemaVersion?: number;
 };
 
-const CURRENT_SETTINGS_SCHEMA_VERSION = 4;
+export const CURRENT_SETTINGS_SCHEMA_VERSION = 5;
+const BASE_ZOOM_SETTINGS_SCHEMA_VERSION = 5;
 
 function migratePersistedSettings(value: PersistedSettings): PersistedSettings {
   const version = Number.isFinite(value.settingsSchemaVersion)
@@ -870,6 +907,15 @@ function migratePersistedSettings(value: PersistedSettings): PersistedSettings {
     ...value,
     settingsSchemaVersion: CURRENT_SETTINGS_SCHEMA_VERSION
   };
+  if (version < BASE_ZOOM_SETTINGS_SCHEMA_VERSION) {
+    next.uiScalePercent = migrateLegacyUiScalePercent(value.uiScalePercent);
+    if (value.customProfile) {
+      next.customProfile = {
+        ...value.customProfile,
+        uiScalePercent: migrateLegacyUiScalePercent(value.customProfile.uiScalePercent)
+      };
+    }
+  }
   return next;
 }
 
@@ -890,16 +936,23 @@ function normalizeSettings(value: Partial<CompanionSettings> | null | undefined)
   return {
     selectedPresetId,
     uiScalePercent: normalizeUiScalePercent(value?.uiScalePercent),
+    uiTextScalePercent: normalizeUiTextScalePercent(value?.uiTextScalePercent),
     uiThemePreset: normalizeUiThemePreset(value?.uiThemePreset),
+    uiLocale: normalizeUiLocalePreference(value?.uiLocale),
     launchAtStartupEnabled: typeof value?.launchAtStartupEnabled === 'boolean'
       ? value.launchAtStartupEnabled
       : DEFAULT_SETTINGS.launchAtStartupEnabled,
     showBatteryPercentTrayIcon: typeof value?.showBatteryPercentTrayIcon === 'boolean'
       ? value.showBatteryPercentTrayIcon
       : DEFAULT_SETTINGS.showBatteryPercentTrayIcon,
+    closeButtonQuits: typeof value?.closeButtonQuits === 'boolean'
+      ? value.closeButtonQuits
+      : DEFAULT_SETTINGS.closeButtonQuits,
     kitsuneInputPromotionDismissed: typeof value?.kitsuneInputPromotionDismissed === 'boolean'
       ? value.kitsuneInputPromotionDismissed
       : DEFAULT_SETTINGS.kitsuneInputPromotionDismissed,
+    // Settings saved before this flag existed read as not shown, so every user sees the offer once.
+    kitsuneInputLaunchOfferShown: value?.kitsuneInputLaunchOfferShown === true,
     firmwareLogDirectory: typeof value?.firmwareLogDirectory === 'string' && value.firmwareLogDirectory.trim()
       ? value.firmwareLogDirectory.trim()
       : DEFAULT_SETTINGS.firmwareLogDirectory,
@@ -969,7 +1022,12 @@ function normalizeSettings(value: Partial<CompanionSettings> | null | undefined)
       && value.selectedBridgePath.length <= 4096
       ? value.selectedBridgePath
       : null,
+    selectedBridgeUniqueId: typeof value?.selectedBridgeUniqueId === 'string'
+      && /^[0-9a-f]{16}$/i.test(value.selectedBridgeUniqueId)
+      ? value.selectedBridgeUniqueId.toLowerCase()
+      : null,
     bridgeIdentities: normalizeBridgeIdentities(value?.bridgeIdentities),
+    bridgeWorkspaces: normalizeBridgeWorkspaces(value?.bridgeWorkspaces),
     controllerBindings: normalizeControllerBindings(value?.controllerBindings, controllerProfiles),
     micVolumePercent: Number.isFinite(value?.micVolumePercent)
       ? Math.max(0, Math.min(100, Math.round(value!.micVolumePercent!)))
@@ -1053,6 +1111,12 @@ function normalizeSettings(value: Partial<CompanionSettings> | null | undefined)
     notifyLowBattery: typeof value?.notifyLowBattery === 'boolean'
       ? value.notifyLowBattery
       : DEFAULT_SETTINGS.notifyLowBattery,
+    notifyPersonaChange: typeof value?.notifyPersonaChange === 'boolean'
+      ? value.notifyPersonaChange
+      : DEFAULT_SETTINGS.notifyPersonaChange,
+    notifyMicMute: typeof value?.notifyMicMute === 'boolean'
+      ? value.notifyMicMute
+      : DEFAULT_SETTINGS.notifyMicMute,
     duplexMicEnabled: typeof value?.duplexMicEnabled === 'boolean'
       ? value.duplexMicEnabled
       : DEFAULT_SETTINGS.duplexMicEnabled,
@@ -1077,6 +1141,7 @@ export class SettingsStore {
   private readonly filePath: string;
   private settings: CompanionSettings;
   private customSettings: CompanionSettings;
+  private lastWrittenText: string | null = null;
 
   constructor(public readonly userDataPath: string) {
     this.filePath = path.join(userDataPath, 'settings.json');
@@ -1090,7 +1155,12 @@ export class SettingsStore {
   }
 
   update(next: Partial<CompanionSettings>): CompanionSettings {
-    this.settings = normalizeSettings({ ...this.settings, ...next });
+    const previous = this.settings;
+    this.settings = withTrustedBridgeWorkspaces(transitionBridgeWorkspace(
+      previous,
+      normalizeSettings({ ...previous, ...next }),
+      DEFAULT_BRIDGE_WORKSPACE
+    ));
     if (includesControllerProfileSettingUpdate(next) && next.selectedControllerProfileId === undefined) {
       this.settings = syncSelectedControllerProfile(this.settings);
     }
@@ -1111,7 +1181,15 @@ export class SettingsStore {
     }
 
     if (normalizedPresetId === 'custom') {
-      this.settings = { ...this.customSettings, selectedPresetId: 'custom' };
+      this.settings = {
+        ...this.customSettings,
+        selectedPresetId: 'custom',
+        // A one-time offer stays shown even if the saved custom settings predate it.
+        kitsuneInputLaunchOfferShown: this.settings.kitsuneInputLaunchOfferShown,
+        // The saved custom settings apply to the selected bridge; they never
+        // restore an older bridge selection or other bridges' workspaces.
+        ...bridgeBookkeeping(this.settings)
+      };
     } else {
       this.settings = normalizeSettings({ ...this.settings, ...presetSettings, selectedPresetId: normalizedPresetId });
     }
@@ -1123,15 +1201,15 @@ export class SettingsStore {
   restoreDefaults(): CompanionSettings {
     const controllerProfiles = restoreDefaultControllerProfile(this.settings.controllerProfiles);
     const firmwareLogDirectory = this.settings.firmwareLogDirectory;
-    const selectedBridgePath = this.settings.selectedBridgePath;
-    const bridgeIdentities = this.settings.bridgeIdentities;
     const kitsuneInputPromotionDismissed = this.settings.kitsuneInputPromotionDismissed;
+    const kitsuneInputLaunchOfferShown = this.settings.kitsuneInputLaunchOfferShown;
+    // Defaults replace the selected bridge's settings only; other bridges keep theirs.
     this.settings = normalizeSettings({
       ...DEFAULT_SETTINGS,
       firmwareLogDirectory,
-      selectedBridgePath,
-      bridgeIdentities,
+      ...bridgeBookkeeping(this.settings),
       kitsuneInputPromotionDismissed,
+      kitsuneInputLaunchOfferShown,
       selectedControllerProfileId: DEFAULT_CONTROLLER_PROFILE_ID,
       controllerProfiles
     });
@@ -1364,13 +1442,77 @@ export class SettingsStore {
   }
 
   private write(): void {
-    fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-    fs.writeFileSync(this.filePath, `${JSON.stringify({
+    this.settings = withTrustedBridgeWorkspaces(saveSelectedBridgeWorkspace(this.settings));
+    const text = `${JSON.stringify({
       settingsSchemaVersion: CURRENT_SETTINGS_SCHEMA_VERSION,
       ...this.settings,
-      customProfile: this.customSettings
-    }, null, 2)}\n`, 'utf8');
+      // Bridge bookkeeping lives once, in the live settings.
+      customProfile: { ...this.customSettings, bridgeWorkspaces: {} }
+    }, null, 2)}\n`;
+    // Many updates change nothing; skip rewriting an identical file.
+    if (text === this.lastWrittenText) {
+      return;
+    }
+    fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+    // Write a sibling and rename it over the file, so a crash or power loss
+    // mid-write cannot leave a truncated settings.json that loads as defaults.
+    const temporaryPath = `${this.filePath}.tmp`;
+    try {
+      fs.writeFileSync(temporaryPath, text, 'utf8');
+      fs.renameSync(temporaryPath, this.filePath);
+    } catch {
+      // A scanner or sync client can hold the file; fall back to a direct write.
+      fs.writeFileSync(this.filePath, text, 'utf8');
+      try { fs.rmSync(temporaryPath, { force: true }); } catch { /* best effort */ }
+    }
+    this.lastWrittenText = text;
   }
+}
+
+const DEFAULT_BRIDGE_WORKSPACE: BridgeWorkspace = captureBridgeWorkspace(DEFAULT_SETTINGS);
+
+function bridgeBookkeeping(settings: CompanionSettings): Pick<CompanionSettings,
+  'selectedBridgePath' | 'selectedBridgeUniqueId' | 'bridgeIdentities' | 'bridgeWorkspaces'> {
+  return {
+    selectedBridgePath: settings.selectedBridgePath,
+    selectedBridgeUniqueId: settings.selectedBridgeUniqueId,
+    bridgeIdentities: settings.bridgeIdentities,
+    bridgeWorkspaces: settings.bridgeWorkspaces
+  };
+}
+
+// Workspace maps are replaced, never mutated, so one already normalized can be
+// reused as-is when the live settings are normalized again.
+const normalizedBridgeWorkspaceMaps = new WeakSet<object>();
+
+/** Maps built from normalized live settings need no second normalization. */
+function withTrustedBridgeWorkspaces(settings: CompanionSettings): CompanionSettings {
+  normalizedBridgeWorkspaceMaps.add(settings.bridgeWorkspaces);
+  return settings;
+}
+
+function normalizeBridgeWorkspaces(value: unknown): CompanionSettings['bridgeWorkspaces'] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  if (normalizedBridgeWorkspaceMaps.has(value)) {
+    return value as CompanionSettings['bridgeWorkspaces'];
+  }
+  const result: CompanionSettings['bridgeWorkspaces'] = {};
+  for (const [rawKey, rawWorkspace] of Object.entries(value as Record<string, unknown>)) {
+    const key = rawKey.trim().toLowerCase();
+    if (!isBridgeWorkspaceKey(key) || !rawWorkspace || typeof rawWorkspace !== 'object' || Array.isArray(rawWorkspace)) {
+      continue;
+    }
+    // Missing or invalid values take their defaults, like the live settings.
+    result[key] = captureBridgeWorkspace(normalizeSettings({
+      ...DEFAULT_SETTINGS,
+      ...(rawWorkspace as Partial<CompanionSettings>),
+      bridgeWorkspaces: {}
+    }));
+  }
+  normalizedBridgeWorkspaceMaps.add(result);
+  return result;
 }
 
 function normalizeBridgeIdentities(value: unknown): CompanionSettings['bridgeIdentities'] {
@@ -1383,15 +1525,27 @@ function normalizeBridgeIdentities(value: unknown): CompanionSettings['bridgeIde
     if (!/^[0-9a-f]{16}$/.test(uniqueId) || !rawIdentity || typeof rawIdentity !== 'object' || Array.isArray(rawIdentity)) {
       continue;
     }
-    const identity = rawIdentity as { label?: unknown; containerId?: unknown };
+    const identity = rawIdentity as { label?: unknown; containerId?: unknown; containerIds?: unknown };
     const label = typeof identity.label === 'string' ? identity.label.trim().slice(0, 32) : '';
-    const containerId = typeof identity.containerId === 'string'
-      && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(identity.containerId)
-      ? identity.containerId.toLowerCase()
-      : null;
-    result[uniqueId] = { label: label || null, containerId };
+    const containerId = normalizeContainerId(identity.containerId);
+    const containerIds = Array.from(new Set([
+      containerId,
+      ...(Array.isArray(identity.containerIds) ? identity.containerIds.map(normalizeContainerId) : [])
+    ].filter((candidate): candidate is string => candidate !== null)));
+    result[uniqueId] = {
+      label: label || null,
+      containerId,
+      ...(containerIds.length > (containerId ? 1 : 0) ? { containerIds } : {})
+    };
   }
   return result;
+}
+
+function normalizeContainerId(value: unknown): string | null {
+  return typeof value === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+    ? value.toLowerCase()
+    : null;
 }
 
 function normalizeControllerBindings(

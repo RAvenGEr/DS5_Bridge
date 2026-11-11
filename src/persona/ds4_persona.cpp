@@ -5,6 +5,7 @@
 
 #include "controller_output_policy.h"
 #include "dualsense_output.h"
+#include "persona/persona_identity.h"
 
 namespace {
 
@@ -39,8 +40,10 @@ constexpr uint8_t kDs4FeatureIdentity = 0x81;
 constexpr uint8_t kDs4FeatureBoardInfo = 0xa3;
 constexpr uint8_t kDs4FeatureTelemetry = 0xa4;
 
-constexpr uint8_t kDs4SerialBytes[8] = {0x11, 0x11, 0x02, 0x0b, 0xf6, 0x19, 0xa5, 0x00};
-constexpr char kDs4SerialString[] = "1111020BF619A500";
+// Bytes 2-7 are the persona's address (02:0B:F6:19:A5:00, locally
+// administered). ds4_persona_set_identity_seed replaces it per bridge at boot.
+uint8_t ds4_serial_bytes[8] = {0x11, 0x11, 0x02, 0x0b, 0xf6, 0x19, 0xa5, 0x00};
+char ds4_serial_string[] = "1111020BF619A500";
 constexpr char kDs4BoardString[] = "JDM-055";
 constexpr char kDs4BuildDate[] = "Sep 17 2021";
 constexpr char kDs4BuildTime[] = "11:34:00";
@@ -48,6 +51,17 @@ constexpr char kDs4FirmwareVersion[] = "0001.A00B";
 
 uint8_t ds4_report_counter = 0;
 uint16_t ds4_timestamp = 188;
+// The DualSense motion clock ticks every 1/3 us, a DS4's every 16/3 us.
+// Copying the DualSense value made DS4 motion time run 16x fast and wrap
+// every 21.8 ms, which breaks gyro integration in SDL and Steam.
+constexpr uint32_t kDualSenseTicksPerDs4Tick = 16;
+// The longest step a 16-bit DS4 clock can show (~349.5 ms). A larger gap
+// would wrap into a short one, or means the controller's clock restarted
+// (reconnect), so the DS4 clock resyncs instead.
+constexpr uint32_t kDs4MotionClockMaxGapTicks = 0xffffu * kDualSenseTicksPerDs4Tick;
+bool ds4_motion_clock_started = false;
+uint32_t ds4_motion_last_sensor_timestamp = 0;
+uint32_t ds4_motion_tick_remainder = 0;
 uint8_t ds4_probe_selector[3]{};
 uint8_t ds4_telemetry_subcommand = 0;
 
@@ -62,6 +76,20 @@ void write_i16(uint8_t *data, int16_t value) {
 
 uint16_t clamp_u16(uint16_t value, uint16_t max_value) {
     return value > max_value ? max_value : value;
+}
+
+uint16_t ds4_motion_timestamp(uint32_t sensor_timestamp) {
+    const uint32_t elapsed = sensor_timestamp - ds4_motion_last_sensor_timestamp;
+    ds4_motion_last_sensor_timestamp = sensor_timestamp;
+    if (!ds4_motion_clock_started || elapsed > kDs4MotionClockMaxGapTicks) {
+        ds4_motion_clock_started = true;
+        ds4_motion_tick_remainder = 0;
+        return ds4_timestamp;
+    }
+    const uint32_t ticks = elapsed + ds4_motion_tick_remainder;
+    ds4_timestamp = static_cast<uint16_t>(ds4_timestamp + ticks / kDualSenseTicksPerDs4Tick);
+    ds4_motion_tick_remainder = ticks % kDualSenseTicksPerDs4Tick;
+    return ds4_timestamp;
 }
 
 uint16_t scale_touch_y_to_ds4(uint16_t y) {
@@ -193,10 +221,13 @@ bool ds4_persona_encode_input(
 
     report.bytes[7] = state.left_trigger;
     report.bytes[8] = state.right_trigger;
+    if (!state.motion_valid) {
+        ds4_motion_clock_started = false;
+    }
     write_u16(
         report.bytes + 9,
         state.motion_valid
-            ? static_cast<uint16_t>(state.sensor_timestamp & 0xffff)
+            ? ds4_motion_timestamp(state.sensor_timestamp)
             : ds4_timestamp++
     );
     report.bytes[11] = 0x09;
@@ -296,21 +327,21 @@ uint16_t ds4_persona_get_feature_report(
             return copy_feature_payload(report, 4, buffer, reqlen);
 
         case 0x12: {
-            report[1] = kDs4SerialBytes[7];
-            report[2] = kDs4SerialBytes[6];
-            report[3] = kDs4SerialBytes[5];
-            report[4] = kDs4SerialBytes[4];
-            report[5] = kDs4SerialBytes[3];
-            report[6] = kDs4SerialBytes[2];
-            report[7] = kDs4SerialBytes[1];
-            std::memcpy(report + 8, kDs4SerialBytes, sizeof(kDs4SerialBytes));
+            report[1] = ds4_serial_bytes[7];
+            report[2] = ds4_serial_bytes[6];
+            report[3] = ds4_serial_bytes[5];
+            report[4] = ds4_serial_bytes[4];
+            report[5] = ds4_serial_bytes[3];
+            report[6] = ds4_serial_bytes[2];
+            report[7] = ds4_serial_bytes[1];
+            std::memcpy(report + 8, ds4_serial_bytes, sizeof(ds4_serial_bytes));
             return copy_feature_payload(report, 16, buffer, reqlen);
         }
 
         case kDs4FeatureIdentity:
-            std::memcpy(report + 1, kDs4SerialBytes, sizeof(kDs4SerialBytes));
-            std::memcpy(report + 10, kDs4SerialBytes, sizeof(kDs4SerialBytes));
-            copy_ascii(report + 18, 16, kDs4SerialString);
+            std::memcpy(report + 1, ds4_serial_bytes, sizeof(ds4_serial_bytes));
+            std::memcpy(report + 10, ds4_serial_bytes, sizeof(ds4_serial_bytes));
+            copy_ascii(report + 18, 16, ds4_serial_string);
             copy_ascii(report + 34, 12, kDs4BoardString);
             copy_ascii(report + 46, 11, kDs4BuildDate);
             copy_ascii(report + 57, 7, kDs4FirmwareVersion);
@@ -329,25 +360,25 @@ uint16_t ds4_persona_get_feature_report(
 
         case kDs4FeatureTelemetry:
             if (ds4_telemetry_subcommand == 0x02) {
-                report[1] = kDs4SerialBytes[3];
-                report[2] = kDs4SerialBytes[2];
-                report[3] = kDs4SerialBytes[1];
-                report[4] = kDs4SerialBytes[0];
-                report[5] = kDs4SerialBytes[7];
-                report[6] = kDs4SerialBytes[6];
-                report[7] = kDs4SerialBytes[5];
-                report[8] = kDs4SerialBytes[4];
+                report[1] = ds4_serial_bytes[3];
+                report[2] = ds4_serial_bytes[2];
+                report[3] = ds4_serial_bytes[1];
+                report[4] = ds4_serial_bytes[0];
+                report[5] = ds4_serial_bytes[7];
+                report[6] = ds4_serial_bytes[6];
+                report[7] = ds4_serial_bytes[5];
+                report[8] = ds4_serial_bytes[4];
                 return copy_feature_payload(report, 14, buffer, reqlen);
             }
             if (ds4_telemetry_subcommand == 0x0b) {
-                report[1] = kDs4SerialBytes[3];
-                report[2] = kDs4SerialBytes[2];
-                report[3] = kDs4SerialBytes[1];
-                report[4] = kDs4SerialBytes[0];
-                report[5] = kDs4SerialBytes[7];
-                report[6] = kDs4SerialBytes[6];
-                report[7] = kDs4SerialBytes[5];
-                report[8] = kDs4SerialBytes[4];
+                report[1] = ds4_serial_bytes[3];
+                report[2] = ds4_serial_bytes[2];
+                report[3] = ds4_serial_bytes[1];
+                report[4] = ds4_serial_bytes[0];
+                report[5] = ds4_serial_bytes[7];
+                report[6] = ds4_serial_bytes[6];
+                report[7] = ds4_serial_bytes[5];
+                report[8] = ds4_serial_bytes[4];
                 report[9] = 0xac;
                 report[10] = 0xa8;
                 report[11] = 0x1b;
@@ -391,5 +422,16 @@ void ds4_persona_set_feature_report(
     }
     if (report_id == 0xa0 && bufsize >= 1) {
         ds4_telemetry_subcommand = buffer[0];
+    }
+}
+
+void ds4_persona_set_identity_seed(uint8_t const *seed, uint16_t seed_len) {
+    uint8_t address[6]{};
+    ds5::persona_identity::derive_address(seed, seed_len, ds5::persona_identity::kSaltDs4, address);
+    std::memcpy(ds4_serial_bytes + 2, address, sizeof(address));
+    constexpr char kHexDigits[] = "0123456789ABCDEF";
+    for (std::size_t index = 0; index < sizeof(ds4_serial_bytes); ++index) {
+        ds4_serial_string[index * 2] = kHexDigits[ds4_serial_bytes[index] >> 4];
+        ds4_serial_string[index * 2 + 1] = kHexDigits[ds4_serial_bytes[index] & 0x0f];
     }
 }

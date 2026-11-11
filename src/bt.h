@@ -7,7 +7,6 @@
 #define DS5_BRIDGE_BT_H
 
 #include <cstdint>
-#include <vector>
 
 enum CHANNEL_TYPE {
     INTERRUPT,
@@ -51,6 +50,13 @@ bool bt_disconnect_with_intent(BtControllerDisconnectIntent intent);
 bool bt_expected_disconnect_pending();
 bool bt_power_off_controller();
 bool bt_request_scan();
+// Wake-on-LAN: no controller link, pairing or recent incoming page.
+bool bt_wake_controllers_quiet();
+// Suspends (or restores) page and inquiry scans while Wi-Fi owns the radio.
+void bt_set_wake_radio_quiet(bool quiet);
+// The controller has confirmed scans are off; Wi-Fi may start.
+bool bt_wake_radio_ready();
+void bt_quiesce_gameplay_output();
 bool bt_forget_pairings();
 bool bt_forget_pairing(uint8_t address[6]);
 bool bt_get_device_identity(BtDeviceIdentitySnapshot *snapshot);
@@ -114,7 +120,10 @@ void bt_set_custom_adaptive_trigger_effects(
     uint8_t left_start_percent,
     uint8_t left_wall_percent,
     uint8_t left_force_percent,
-    bool left_active
+    bool left_active,
+    // DualSense motor power byte sent with the effects; pass the game's
+    // body-rumble nibble so a persistent effect does not reset it.
+    uint8_t motor_power
 );
 void bt_replay_adaptive_trigger_effect(
     uint8_t const *right_trigger,
@@ -127,13 +136,25 @@ void bt_replay_adaptive_trigger_effect(
 void bt_reset_adaptive_triggers();
 void bt_set_lightbar_restore_enabled(bool enabled);
 void bt_schedule_lightbar_restore(uint32_t delay_ms);
+// Host output ownership of the lightbar, reset with each controller session.
+void bt_note_host_lightbar_set();
+void bt_note_host_lightbar_released();
+bool bt_host_lightbar_owned();
+// Updates the color a restore applies without showing it now.
+void bt_save_lightbar_color(uint8_t red, uint8_t green, uint8_t blue, uint8_t brightness_percent);
 void bt_lightbar_loop();
 void bt_signal_strength_loop();
 void bt_inquiry_loop();
 void bt_connection_recovery_loop();
 void bt_feature_prefetch_loop();
 void bt_output_retry_loop();
-std::vector<uint8_t> get_feature_data(uint8_t reportId,uint16_t len);
+// Call after each top-level tud_task(): refills the bounded Bluetooth send
+// allowance and issues send requests deferred by nested BTstack callbacks.
+void bt_output_service_after_usb();
+// Copies the cached feature report payload (without its report ID byte) into
+// buffer and requests a fresh copy when needed. Returns whether a cached report
+// existed; *copied receives the payload bytes written.
+bool bt_copy_feature_data(uint8_t report_id, uint8_t *buffer, uint16_t capacity, uint16_t *copied);
 void init_feature();
 void set_feature_data(uint8_t reportId, uint8_t const* data,uint16_t len);
 

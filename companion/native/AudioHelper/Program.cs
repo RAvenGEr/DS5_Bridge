@@ -12,6 +12,31 @@ using NAudio.CoreAudioApi.Interfaces;
 using NAudio.Wave;
 
 var options = HelperOptions.Parse(args);
+// Read-only Wake-on-LAN queries: they open no bridge, HID device or audio endpoint.
+if (options.ListPhysicalEthernetAdapters)
+{
+    Environment.ExitCode = PhysicalEthernetAdapters.PrintJson();
+    return;
+}
+if (options.QueryWakeOnLanReadiness)
+{
+    Environment.ExitCode = WakeOnLanReadiness.PrintJson(args);
+    return;
+}
+// Chord keyboard shortcuts: a resident SendInput server that opens no bridge or audio endpoint.
+if (options.KeyboardInputServer)
+{
+    Environment.ExitCode = await KeyboardInputServer.RunAsync();
+    return;
+}
+// Bridge census: a resident server that answers each "snapshot" line, like
+// Kitsune Input's, instead of a helper process per census. It opens no bridge
+// or audio endpoint.
+if (options.BridgeDeviceServer)
+{
+    await BridgeCensus.RunServerAsync();
+    return;
+}
 EndpointManager.TargetBridgeContainer = options.BridgeContainer;
 if (EndpointManager.TargetBridgeContainer is null
     && options.CompanionDevicePath is { Length: > 0 } targetPath
@@ -183,12 +208,65 @@ static class AudioHelperTestHaptics
 
     public static void Play(HelperOptions options)
     {
+        // Audio already playing to the bridge endpoint (for example headphones
+        // on the controller) reaches the controller as one packet stream. WinUSB
+        // frames would add haptics-only packets beside it and make that audio
+        // stutter, so mix the pattern into the endpoint stream instead.
+        if (TryPlayViaActiveRenderEndpoint(options))
+        {
+            return;
+        }
+
         if (TryPlayViaBridgeFrames(options.HapticsGainPercent, options.CompanionDevicePath))
         {
             return;
         }
 
         PlayViaRenderEndpoint(options);
+    }
+
+    private static bool TryPlayViaActiveRenderEndpoint(HelperOptions options)
+    {
+        using var enumerator = new MMDeviceEnumerator();
+        MMDevice device;
+        try
+        {
+            device = SelectBridgeRenderEndpoint(enumerator, options);
+            if (device.AudioClient.MixFormat.Channels < 4 || !HasActiveRenderSession(device))
+            {
+                return false;
+            }
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+
+        PlayOnRenderEndpoint(device, options.HapticsGainPercent);
+        return true;
+    }
+
+    private static bool HasActiveRenderSession(MMDevice device)
+    {
+        var sessions = device.AudioSessionManager.Sessions;
+        for (var index = 0; index < sessions.Count; index++)
+        {
+            var session = sessions[index];
+            if (session.State == AudioSessionState.AudioSessionStateActive
+                && session.GetProcessID != Environment.ProcessId)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static MMDevice SelectBridgeRenderEndpoint(MMDeviceEnumerator enumerator, HelperOptions options)
+    {
+        return !string.IsNullOrWhiteSpace(options.BridgePersona)
+            ? EndpointManager.SelectRenderBridgeEndpointForPersona(enumerator, options.BridgePersona)
+            : EndpointManager.SelectRenderEndpoint(enumerator, options.DeviceName);
     }
 
     private static bool TryPlayViaBridgeFrames(int hapticsGainPercent, string? devicePath)
@@ -241,9 +319,11 @@ static class AudioHelperTestHaptics
     private static void PlayViaRenderEndpoint(HelperOptions options)
     {
         using var enumerator = new MMDeviceEnumerator();
-        var device = !string.IsNullOrWhiteSpace(options.BridgePersona)
-            ? EndpointManager.SelectRenderBridgeEndpointForPersona(enumerator, options.BridgePersona)
-            : EndpointManager.SelectRenderEndpoint(enumerator, options.DeviceName);
+        PlayOnRenderEndpoint(SelectBridgeRenderEndpoint(enumerator, options), options.HapticsGainPercent);
+    }
+
+    private static void PlayOnRenderEndpoint(MMDevice device, int hapticsGainPercent)
+    {
         var format = device.AudioClient.MixFormat;
         if (format.Channels < 4)
         {
@@ -251,7 +331,7 @@ static class AudioHelperTestHaptics
                 $"Test haptics requires a 4-channel bridge audio endpoint; '{device.FriendlyName}' exposes {format.Channels} channel(s).");
         }
 
-        var pcm = BuildTestPcm(format, options.HapticsGainPercent);
+        var pcm = BuildTestPcm(format, hapticsGainPercent);
         var waveProvider = new BufferedWaveProvider(format)
         {
             BufferDuration = TimeSpan.FromSeconds(1),
@@ -2775,6 +2855,10 @@ sealed record HelperOptions(
     public bool ListBridges { get; init; }
     public string? CompanionDevicePath { get; init; }
     public Guid? BridgeContainer { get; init; }
+    public bool ListPhysicalEthernetAdapters { get; init; }
+    public bool QueryWakeOnLanReadiness { get; init; }
+    public bool KeyboardInputServer { get; init; }
+    public bool BridgeDeviceServer { get; init; }
 
     public string SourceArgument => Source switch
     {
@@ -2807,6 +2891,10 @@ sealed record HelperOptions(
         var listBridges = false;
         string? companionDevicePath = null;
         Guid? bridgeContainer = null;
+        var listPhysicalEthernetAdapters = false;
+        var queryWakeOnLanReadiness = false;
+        var keyboardInputServer = false;
+        var bridgeDeviceServer = false;
         var micKeepaliveOnly = false;
         int? appProcessId = null;
         string? appProcessPath = null;
@@ -2956,6 +3044,19 @@ sealed record HelperOptions(
                         bridgeContainer = parsedBridgeContainer;
                     }
                     break;
+                case "--list-physical-ethernet-adapters":
+                    listPhysicalEthernetAdapters = true;
+                    break;
+                case "--wake-on-lan-readiness":
+                    // --target-mac is read from the raw arguments by WakeOnLanReadiness.
+                    queryWakeOnLanReadiness = true;
+                    break;
+                case "--keyboard-input-server":
+                    keyboardInputServer = true;
+                    break;
+                case "--bridge-device-server":
+                    bridgeDeviceServer = true;
+                    break;
                 case "--mic-keepalive-only":
                     micKeepaliveOnly = true;
                     break;
@@ -3028,7 +3129,11 @@ sealed record HelperOptions(
         {
             ListBridges = listBridges,
             CompanionDevicePath = companionDevicePath,
-            BridgeContainer = bridgeContainer
+            BridgeContainer = bridgeContainer,
+            ListPhysicalEthernetAdapters = listPhysicalEthernetAdapters,
+            QueryWakeOnLanReadiness = queryWakeOnLanReadiness,
+            KeyboardInputServer = keyboardInputServer,
+            BridgeDeviceServer = bridgeDeviceServer
         };
     }
 

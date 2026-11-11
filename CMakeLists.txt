@@ -66,6 +66,53 @@ set(TINYUSB_OPT_OS OPT_OS_NONE CACHE STRING "TinyUSB OS abstraction for DS5 Brid
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
+# Patched copies of the CYW43 Bluetooth transport (see cmake/patch-cyw43.cmake):
+# bounded receive continuation, the single-pass packet reader with retained
+# overflow evidence, bounded backplane-window reuse and the F2 readiness fix.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch-cyw43.cmake")
+set(DS5_CYW43_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated/ds5-cyw43")
+set(DS5_SDK_CYW43_DIR "${PICO_SDK_PATH}/src/rp2_common/pico_cyw43_driver")
+ds5_generate_cyw43_hci_transport(
+        "${DS5_SDK_CYW43_DIR}/btstack_hci_transport_cyw43.c"
+        "${DS5_CYW43_GENERATED_DIR}/btstack_hci_transport_cyw43.c"
+)
+ds5_generate_cyw43_shared_bus(
+        "${DS5_SDK_CYW43_DIR}/cybt_shared_bus/cybt_shared_bus.c"
+        "${DS5_CYW43_GENERATED_DIR}/cybt_shared_bus.c"
+)
+ds5_generate_cyw43_payload(
+        "${PICO_CYW43_DRIVER_PATH}/src/cyw43_ll.c"
+        "${DS5_SDK_CYW43_DIR}/cyw43_bus_pio_spi.c"
+        "${DS5_SDK_CYW43_DIR}/cybt_shared_bus/cybt_shared_bus_driver.c"
+        "${DS5_CYW43_GENERATED_DIR}"
+)
+ds5_replace_sdk_interface_source(pico_btstack_hci_transport_cyw43
+        "${DS5_SDK_CYW43_DIR}/btstack_hci_transport_cyw43.c"
+        "${DS5_CYW43_GENERATED_DIR}/btstack_hci_transport_cyw43.c")
+ds5_replace_sdk_interface_source(cybt_shared_bus
+        "${DS5_SDK_CYW43_DIR}/cybt_shared_bus/cybt_shared_bus.c"
+        "${DS5_CYW43_GENERATED_DIR}/cybt_shared_bus.c")
+ds5_replace_sdk_interface_source(cybt_shared_bus
+        "${DS5_SDK_CYW43_DIR}/cybt_shared_bus/cybt_shared_bus_driver.c"
+        "${DS5_CYW43_GENERATED_DIR}/cybt_shared_bus_driver.c")
+ds5_replace_sdk_interface_source(cyw43_driver
+        "${PICO_CYW43_DRIVER_PATH}/src/cyw43_ll.c"
+        "${DS5_CYW43_GENERATED_DIR}/cyw43_ll.c")
+ds5_replace_sdk_interface_source(cyw43_driver_picow
+        "${DS5_SDK_CYW43_DIR}/cyw43_bus_pio_spi.c"
+        "${DS5_CYW43_GENERATED_DIR}/cyw43_bus_pio_spi.c")
+# Wake-on-LAN station control (companion builds only; see src/wake_on_lan.cpp).
+set(DS5_CYW43_CTRL_OBJECT lib/cyw43-driver/src/cyw43_ctrl.c.o)
+if(ENABLE_COMPANION)
+    ds5_generate_cyw43_wol_ctrl(
+            "${PICO_CYW43_DRIVER_PATH}/src/cyw43_ctrl.c"
+            "${DS5_CYW43_GENERATED_DIR}/cyw43_ctrl.c")
+    ds5_replace_sdk_interface_source(cyw43_driver
+            "${PICO_CYW43_DRIVER_PATH}/src/cyw43_ctrl.c"
+            "${DS5_CYW43_GENERATED_DIR}/cyw43_ctrl.c")
+    set(DS5_CYW43_CTRL_OBJECT generated/ds5-cyw43/cyw43_ctrl.c.o)
+endif()
+
 # Add executable. Default name is the project name, version 0.1
 
 add_executable(ds5-bridge
@@ -90,8 +137,32 @@ add_executable(ds5-bridge
         src/audio.cpp
         src/bt.cpp
         src/firmware_log.cpp
+        src/runtime_fail_fast.cpp
         src/watchdog_telemetry.cpp
+        src/wake_on_lan.cpp
 )
+
+# Third-party archives follow the firmware's exception/RTTI policy instead of
+# retaining an otherwise unused exception-unwinding runtime.
+function(ds5_apply_pico_archive_compile_policy target)
+    target_compile_options(${target} PRIVATE -fsigned-char)
+    if(NOT PICO_CXX_ENABLE_EXCEPTIONS)
+        target_compile_definitions(${target} PRIVATE PICO_CXX_ENABLE_EXCEPTIONS=0)
+        target_compile_options(${target} PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>
+            $<$<COMPILE_LANGUAGE:CXX>:-fno-unwind-tables>
+        )
+    endif()
+    if(NOT PICO_CXX_ENABLE_RTTI)
+        target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
+    endif()
+    if(NOT PICO_CXX_ENABLE_CXA_ATEXIT)
+        target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-fno-use-cxa-atexit>)
+    endif()
+    if(NOT PICO_NO_GC_SECTIONS)
+        target_compile_options(${target} PRIVATE -ffunction-sections -fdata-sections)
+    endif()
+endfunction()
 
 # Cockos WDLResampler
 add_library(wdl_resampler STATIC
@@ -100,29 +171,60 @@ add_library(wdl_resampler STATIC
 target_include_directories(wdl_resampler PUBLIC
         lib/WDL/WDL
 )
+ds5_apply_pico_archive_compile_policy(wdl_resampler)
 
 # Opus
+# The DualSense speaker path encodes CELT-only frames: audio.cpp creates the
+# encoder with OPUS_APPLICATION_RESTRICTED_CELT at 48 kHz stereo, 10 ms, CBR,
+# complexity 0. That application never allocates, initializes or runs the SILK
+# encoder, and complexity 0 never runs the tonality analysis. The linker
+# wrappers on ds5-bridge redirect those entry points so --gc-sections can
+# discard both trees instead of copying them to SRAM. The stack protector is
+# disabled: its canaries sat in every codec hot loop while hardening checks
+# (OPUS_HARDENING) remain enabled.
+set(OPUS_STACK_PROTECTOR OFF CACHE BOOL "DS5 Bridge keeps Opus hardening without stack canaries" FORCE)
+set(OPUS_STACK_PROTECTOR OFF)
 add_subdirectory(lib/opus)
 
-# Relocate libopus into Pico SDK .time_critical sections so the host fallback
-# encoder runs from SRAM instead of XIP flash.
+# Keep live Opus instructions and numerical tables in SRAM. Preserve individual
+# sections so the linker can discard unused routines and tables. Diagnostic
+# strings stay in flash; normalize legacy archives on incremental builds too.
 add_custom_command(
         OUTPUT ${CMAKE_BINARY_DIR}/opus_ram_relocate.stamp
-        COMMAND ${CMAKE_OBJCOPY}
-                --rename-section .text=.time_critical.opus_text
-                --rename-section .rodata=.time_critical.opus_rodata
-                --rename-section .rodata.str1.4=.time_critical.opus_strings
-                $<TARGET_FILE:opus>
+        COMMAND ${CMAKE_COMMAND}
+                "-DARCHIVE=$<TARGET_FILE:opus>"
+                "-DOBJDUMP=${CMAKE_OBJDUMP}"
+                "-DOBJCOPY=${CMAKE_OBJCOPY}"
+                -P "${CMAKE_SOURCE_DIR}/cmake/relocate_opus_sections.cmake"
         COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_BINARY_DIR}/opus_ram_relocate.stamp
         DEPENDS $<TARGET_FILE:opus>
-        COMMENT "Relocating libopus to .time_critical.* sections"
+                "${CMAKE_SOURCE_DIR}/cmake/relocate_opus_sections.cmake"
+                "${CMAKE_SOURCE_DIR}/cmake/opus_sections.cmake"
+        COMMENT "Placing Opus code/tables in SRAM and diagnostic strings in flash"
         VERBATIM
 )
 add_custom_target(opus_ram_relocate ALL DEPENDS ${CMAKE_BINARY_DIR}/opus_ram_relocate.stamp)
 add_dependencies(ds5-bridge opus_ram_relocate)
 
-target_compile_options(opus PRIVATE -O2)
-target_compile_options(wdl_resampler PRIVATE -O2 -fsigned-char -ffunction-sections)
+# Opus' hardening failure path normally formats a diagnostic through fprintf.
+# The firmware supplies a watchdog-backed fail-fast implementation instead, and
+# the forced include discards the message and source-path strings before they
+# are emitted while the hardening checks keep running.
+target_compile_definitions(opus PRIVATE OVERRIDE_celt_fatal)
+target_compile_options(opus PRIVATE -O2 -ffunction-sections -fdata-sections)
+target_compile_options(opus PRIVATE
+        "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/cmake/opus_fatal_override.h"
+        # The rewritten celt_fatal prototype loses its parameter list in C.
+        -Wno-strict-prototypes)
+target_link_options(ds5-bridge PRIVATE
+        "LINKER:--wrap=silk_Encode"
+        "LINKER:--wrap=silk_InitEncoder"
+        "LINKER:--wrap=run_analysis"
+        "LINKER:--wrap=tonality_analysis_init"
+        "LINKER:--wrap=tonality_analysis_reset"
+        "LINKER:--wrap=tonality_get_info"
+)
+target_compile_options(wdl_resampler PRIVATE -O2)
 add_custom_command(TARGET wdl_resampler POST_BUILD
         COMMAND ${CMAKE_OBJCOPY}
                 --rename-section .text._ZN13WDL_Resampler11ResampleOutEPfiii=.time_critical.WDL_ResampleOut
@@ -169,29 +271,36 @@ relocate_to_ram(
         "Relocating TinyUSB FIFO data path to SRAM"
 )
 relocate_to_ram(
-        src/rp2_common/pico_cyw43_driver/cyw43_bus_pio_spi.c.o
+        generated/ds5-cyw43/cyw43_bus_pio_spi.c.o
         ".text.cyw43_spi_transfer=.time_critical.cyw43_spi_transfer@.text.cyw43_read_bytes=.time_critical.cyw43_read_bytes@.text.cyw43_write_bytes=.time_critical.cyw43_write_bytes@.text.cyw43_read_reg_u32=.time_critical.cyw43_read_reg_u32@.text.cyw43_read_reg_u16=.time_critical.cyw43_read_reg_u16@.text.cyw43_read_reg_u8=.time_critical.cyw43_read_reg_u8@.text.cyw43_write_reg_u32=.time_critical.cyw43_write_reg_u32@.text.cyw43_write_reg_u16=.time_critical.cyw43_write_reg_u16@.text.cyw43_write_reg_u8=.time_critical.cyw43_write_reg_u8@.text.read_reg_u32_swap=.time_critical.read_reg_u32_swap@.text.write_reg_u32_swap=.time_critical.write_reg_u32_swap@.text.ns_delay.constprop.0=.time_critical.cyw43_ns_delay"
         "Relocating CYW43 PIO-SPI transport to SRAM"
 )
 relocate_to_ram(
-        lib/cyw43-driver/src/cyw43_ll.c.o
+        generated/ds5-cyw43/cyw43_ll.c.o
         ".text.cyw43_ll_bus_sleep=.time_critical.cyw43_ll_bus_sleep@.text.cyw43_ll_sdpcm_poll_device=.time_critical.cyw43_ll_sdpcm_poll_device@.text.cyw43_ll_process_packets=.time_critical.cyw43_ll_process_packets@.text.cyw43_sdpcm_send_common=.time_critical.cyw43_sdpcm_send_common@.text.cyw43_do_ioctl.part.0=.time_critical.cyw43_do_ioctl@.text.cyw43_ll_bt_has_work=.time_critical.cyw43_ll_bt_has_work@.text.cyw43_ll_parse_async_event=.time_critical.cyw43_ll_parse_async_event"
         "Relocating CYW43 SDPCM pump to SRAM"
 )
 relocate_to_ram(
-        lib/cyw43-driver/src/cyw43_ctrl.c.o
+        ${DS5_CYW43_CTRL_OBJECT}
         ".text.cyw43_ensure_up=.time_critical.cyw43_ensure_up@.text.cyw43_cb_ensure_awake=.time_critical.cyw43_cb_ensure_awake@.text.cyw43_poll_func=.time_critical.cyw43_poll_func@.text.cyw43_bluetooth_hci_read=.time_critical.cyw43_bluetooth_hci_read@.text.cyw43_bluetooth_hci_write=.time_critical.cyw43_bluetooth_hci_write"
         "Relocating CYW43 poll and Bluetooth HCI bus to SRAM"
 )
 relocate_to_ram(
-        src/rp2_common/pico_cyw43_driver/cybt_shared_bus/cybt_shared_bus.c.o
-        ".text.cyw43_btbus_write=.time_critical.cyw43_btbus_write"
-        "Relocating CYW43 shared-bus write to SRAM"
+        generated/ds5-cyw43/cybt_shared_bus.c.o
+        ".text.cyw43_btbus_write=.time_critical.cyw43_btbus_write@.text.cyw43_btbus_read=.time_critical.cyw43_btbus_read@.text.cybt_hci_read=.time_critical.cybt_hci_read"
+        "Relocating CYW43 shared-bus read and write to SRAM"
 )
 relocate_to_ram(
-        src/rp2_common/pico_cyw43_driver/cybt_shared_bus/cybt_shared_bus_driver.c.o
-        ".text.cybt_awake=.time_critical.cybt_awake@.text.cybt_set_bt_awake=.time_critical.cybt_set_bt_awake@.text.cybt_get_bt_buf_index=.time_critical.cybt_get_bt_buf_index@.text.cybt_toggle_bt_intr=.time_critical.cybt_toggle_bt_intr@.text.cybt_reg_write_idx=.time_critical.cybt_reg_write_idx@.text.cybt_mem_write_idx=.time_critical.cybt_mem_write_idx"
+        generated/ds5-cyw43/cybt_shared_bus_driver.c.o
+        ".text.cybt_awake=.time_critical.cybt_awake@.text.cybt_set_bt_awake=.time_critical.cybt_set_bt_awake@.text.cybt_get_bt_buf_index=.time_critical.cybt_get_bt_buf_index@.text.cybt_toggle_bt_intr=.time_critical.cybt_toggle_bt_intr@.text.cybt_reg_write_idx=.time_critical.cybt_reg_write_idx@.text.cybt_mem_write_idx=.time_critical.cybt_mem_write_idx@.text.cybt_mem_read_idx=.time_critical.cybt_mem_read_idx"
         "Relocating CYW43 shared-bus packet helpers to SRAM"
+)
+# Every received Bluetooth packet is read by the transport's data-source
+# callback through cyw43_btbus_read, cybt_hci_read and cybt_mem_read_idx.
+relocate_to_ram(
+        generated/ds5-cyw43/btstack_hci_transport_cyw43.c.o
+        ".text.hci_transport_data_source_process=.time_critical.hci_transport_data_source_process@.text.cyw43_bluetooth_hci_process=.time_critical.cyw43_bluetooth_hci_process"
+        "Relocating the CYW43 HCI receive callback to SRAM"
 )
 relocate_to_ram(
         src/rp2_common/pico_cyw43_driver/cyw43_driver.c.o
@@ -210,11 +319,6 @@ relocate_to_ram(
 )
 
 # Tier 2: transmit pumps and USB transfer submission.
-relocate_to_ram(
-        src/bt.cpp.o
-        ".text._ZNSt6vectorIhSaIhEE13_M_assign_auxIPKhEEvT_S5_St20forward_iterator_tag.isra.0=.time_critical.audio_packet_vector_assign"
-        "Relocating reusable audio packet copy to SRAM"
-)
 relocate_to_ram(
         lib/btstack/src/hci.c.o
         ".text.hci_run=.time_critical.hci_run@.text.hci_send_acl_packet_fragments=.time_critical.hci_send_acl_packet_fragments@.text.hci_send_acl_packet_buffer=.time_critical.hci_send_acl_packet_buffer@.text.hci_can_send_prepared_acl_packet_now=.time_critical.hci_can_send_prepared_acl_packet_now@.text.hci_can_send_acl_packet_now=.time_critical.hci_can_send_acl_packet_now@.text.hci_can_send_acl_classic_packet_now=.time_critical.hci_can_send_acl_classic_packet_now@.text.hci_is_packet_buffer_reserved=.time_critical.hci_is_packet_buffer_reserved@.text.hci_reserve_packet_buffer=.time_critical.hci_reserve_packet_buffer@.text.hci_get_outgoing_packet_buffer=.time_critical.hci_get_outgoing_packet_buffer@.text.hci_non_flushable_packet_boundary_flag_supported=.time_critical.hci_non_flushable_packet_boundary_flag_supported@.text.hci_automatic_flush_timeout=.time_critical.hci_automatic_flush_timeout"
@@ -251,24 +355,49 @@ relocate_to_ram(
         "Relocating BTstack async-context clock to SRAM"
 )
 relocate_to_ram(
-        src/rp2_common/pico_cyw43_driver/btstack_hci_transport_cyw43.c.o
+        generated/ds5-cyw43/btstack_hci_transport_cyw43.c.o
         ".text.hci_transport_cyw43_send_packet=.time_critical.hci_transport_cyw43_send_packet"
         "Relocating CYW43 HCI packet send entry to SRAM"
 )
 relocate_to_ram(
-        lib/cyw43-driver/src/cyw43_ll.c.o
+        generated/ds5-cyw43/cyw43_ll.c.o
         ".text.cyw43_ll_write_backplane_mem=.time_critical.cyw43_ll_write_backplane_mem@.text.cyw43_ll_read_backplane_mem=.time_critical.cyw43_ll_read_backplane_mem@.text.cyw43_write_backplane=.time_critical.cyw43_write_backplane@.text.cyw43_read_backplane.constprop.0=.time_critical.cyw43_read_backplane"
         "Relocating CYW43 backplane accessors to SRAM"
 )
+# Every HCI payload is copied through the bounded window-reuse writer/reader,
+# which select and restore the backplane window around each ring segment.
+relocate_to_ram(
+        generated/ds5-cyw43/cyw43_ll.c.o
+        ".text.ds5_cyw43_write_backplane_mem_batched=.time_critical.ds5_cyw43_write_backplane_mem_batched@.text.ds5_cyw43_read_backplane_mem_batched=.time_critical.ds5_cyw43_read_backplane_mem_batched@.text.cyw43_set_backplane_window=.time_critical.cyw43_set_backplane_window@.text.cyw43_set_backplane_window.constprop.0=.time_critical.cyw43_set_backplane_window_default@.text.cyw43_read_backplane=.time_critical.cyw43_read_backplane_generic@.text.cyw43_ll_read_backplane_reg=.time_critical.cyw43_ll_read_backplane_reg@.text.cyw43_ll_write_backplane_reg=.time_critical.cyw43_ll_write_backplane_reg"
+        "Relocating bounded HCI window-reuse and register helpers to SRAM"
+)
+# tud_task locks its event queue through usbd_int_set -> dcd_int_enable/disable
+# -> irq_set_enabled on every call, several times per main-loop pass. Each
+# input report also claims, checks and starts its endpoint transfer.
 relocate_to_ram(
         lib/tinyusb/src/device/usbd.c.o
-        ".text.tud_task_ext=.time_critical.tud_task_ext@.text.usbd_edpt_xfer=.time_critical.usbd_edpt_xfer@.text.usbd_edpt_xfer_fifo=.time_critical.usbd_edpt_xfer_fifo"
+        ".text.tud_task_ext=.time_critical.tud_task_ext@.text.usbd_edpt_xfer=.time_critical.usbd_edpt_xfer@.text.usbd_edpt_xfer_fifo=.time_critical.usbd_edpt_xfer_fifo@.text.usbd_int_set=.time_critical.usbd_int_set@.text.usbd_edpt_claim=.time_critical.usbd_edpt_claim@.text.usbd_edpt_busy=.time_critical.usbd_edpt_busy@.text.tud_mounted=.time_critical.tud_mounted@.text.tud_suspended=.time_critical.tud_suspended@.text.tud_event_hook_cb=.time_critical.tud_event_hook_cb"
         "Relocating TinyUSB device task and transfers to SRAM"
 )
 relocate_to_ram(
+        lib/tinyusb/src/tusb.c.o
+        ".text.tu_edpt_claim=.time_critical.tu_edpt_claim"
+        "Relocating TinyUSB endpoint claim to SRAM"
+)
+relocate_to_ram(
         lib/tinyusb/src/portable/raspberrypi/rp2040/dcd_rp2040.c.o
-        ".text.dcd_edpt_xfer=.time_critical.dcd_edpt_xfer@.text.dcd_edpt_iso_activate=.time_critical.dcd_edpt_iso_activate"
+        ".text.dcd_edpt_xfer=.time_critical.dcd_edpt_xfer@.text.dcd_edpt_iso_activate=.time_critical.dcd_edpt_iso_activate@.text.dcd_int_enable=.time_critical.dcd_int_enable@.text.dcd_int_disable=.time_critical.dcd_int_disable"
         "Relocating RP2040 USB transfer submission to SRAM"
+)
+relocate_to_ram(
+        lib/tinyusb/src/portable/raspberrypi/rp2040/rp2040_usb.c.o
+        ".text.rp2usb_xfer_start=.time_critical.rp2usb_xfer_start"
+        "Relocating RP2040 USB transfer start to SRAM"
+)
+relocate_to_ram(
+        src/rp2_common/hardware_irq/irq.c.o
+        ".text.irq_set_enabled=.time_critical.irq_set_enabled"
+        "Relocating the IRQ enable helper to SRAM"
 )
 relocate_to_ram(
         lib/tinyusb/src/class/audio/audio_device.c.o
@@ -279,14 +408,21 @@ relocate_to_ram(
 # Tier 3: controller input-report and scheduler tail.
 relocate_to_ram(
         src/main.cpp.o
-        ".text._Z10on_bt_data12CHANNEL_TYPEPht=.time_critical.controller_input_bt_callback@.text._Z14interrupt_loopv=.time_critical.controller_input_usb_submit"
+        ".text._Z10on_bt_data12CHANNEL_TYPEPht=.time_critical.controller_input_bt_callback@.text._Z14interrupt_loopv=.time_critical.controller_input_usb_submit@.text._Z26host_input_report_completev=.time_critical.controller_input_usb_complete"
         "Relocating controller input receive and USB submission to SRAM"
 )
 relocate_to_ram(
-        src/companion.cpp.o
-        ".text._ZN12_GLOBAL__N_120queue_shortcut_eventEh|.text._ZN12_GLOBAL__N_1L20queue_shortcut_eventEh=.time_critical.controller_input_shortcut_queue@.text._ZN12_GLOBAL__N_127dpad_direction_from_buttonsEbbbb|.text._ZN12_GLOBAL__N_1L27dpad_direction_from_buttonsEbbbb=.time_critical.controller_input_dpad_remap@.text._Z35companion_process_controller_reportPht=.time_critical.controller_input_companion_process@.text._Z34companion_update_controller_reportPKht=.time_critical.controller_input_companion_snapshot"
-        "Relocating companion controller-report processing to SRAM"
+        src/usb.cpp.o
+        ".text.tud_hid_report_complete_cb=.time_critical.tud_hid_report_complete_cb"
+        "Relocating the HID input completion callback to SRAM"
 )
+if(ENABLE_COMPANION)
+    relocate_to_ram(
+            src/companion.cpp.o
+            ".text._ZN12_GLOBAL__N_120queue_shortcut_eventEh|.text._ZN12_GLOBAL__N_1L20queue_shortcut_eventEh=.time_critical.controller_input_shortcut_queue@.text._ZN12_GLOBAL__N_127dpad_direction_from_buttonsEbbbb|.text._ZN12_GLOBAL__N_1L27dpad_direction_from_buttonsEbbbb=.time_critical.controller_input_dpad_remap@.text._Z35companion_process_controller_reportPht=.time_critical.controller_input_companion_process@.text._Z34companion_update_controller_reportPKht=.time_critical.controller_input_companion_snapshot"
+            "Relocating companion controller-report processing to SRAM"
+    )
+endif()
 relocate_to_ram(
         src/dualsense_input_decoder.cpp.o
         ".text._Z33dualsense_decode_usb_input_reportPKhtR21BridgeControllerState=.time_critical.controller_input_decode"
@@ -343,6 +479,71 @@ relocate_to_ram(
         "Relocating BTstack run-loop poll path to SRAM"
 )
 
+# Tier 4: core 1's double-precision math. The SRAM-resident Opus encoder calls
+# cos per quantized band, exp/log/acos/atan2 and double arithmetic per frame,
+# and floor/sqrt per sample or band in both codec directions. pico_double
+# links these in flash by default, so every speaker frame left SRAM.
+relocate_to_ram(
+        src/rp2_common/pico_double/double_sci_m33.S.o
+        ".text.__wrap_sin_cos=.time_critical.double_sin_cos@.text.drrcore=.time_critical.double_range_reduce_core@.text.rtwopi=.time_critical.double_two_over_pi@.text.dpack=.time_critical.double_pack@.text.dreduce=.time_critical.double_reduce@.text.exptab=.time_critical.double_exptab@.text.__wrap_exp=.time_critical.double_exp@.text.__wrap_log=.time_critical.double_log@.text.trigtab=.time_critical.double_trigtab@.text.__wrap_atan2=.time_critical.double_atan2"
+        "Relocating Opus double sin/cos, exp, log and atan2 to SRAM"
+)
+relocate_to_ram(
+        src/rp2_common/pico_double/double_aeabi_dcp.S.o
+        ".text.__rp2350_dcp_engaged_state_save_restore=.time_critical.double_dcp_state@.text.__wrap___aeabi_dadd=.time_critical.double_add@.text.__wrap___aeabi_dsub=.time_critical.double_sub@.text.__wrap___aeabi_drsub=.time_critical.double_rsub@.text.__wrap___aeabi_dmul=.time_critical.double_mul@.text.ddiv_fast=.time_critical.double_div_fast@.text.__wrap___aeabi_ddiv=.time_critical.double_div@.text.sqrt_fast=.time_critical.double_sqrt_fast@.text.__wrap_sqrt=.time_critical.double_sqrt@.text.dclassify=.time_critical.double_classify@.text.__wrap___aeabi_d2f=.time_critical.double_to_float@.text.__wrap___aeabi_i2d=.time_critical.int_to_double@.text.double2int=.time_critical.double_to_int_impl@.text.__wrap___aeabi_d2iz=.time_critical.double_to_int@.text.__wrap___aeabi_dcmp=.time_critical.double_compare@.text.__wrap___aeabi_dcmpun=.time_critical.double_compare_unordered@.text.__wrap___aeabi_dcmpeq=.time_critical.double_compare_eq@.text.__wrap___aeabi_dcmplt=.time_critical.double_compare_lt@.text.__wrap___aeabi_dcmple=.time_critical.double_compare_le@.text.__wrap___aeabi_dcmpge=.time_critical.double_compare_ge@.text.__wrap___aeabi_dcmpgt=.time_critical.double_compare_gt"
+        "Relocating Opus double arithmetic and sqrt to SRAM"
+)
+relocate_to_ram(
+        src/rp2_common/pico_double/double_math.c.o
+        ".text.__wrap_floor=.time_critical.double_floor@.text.__wrap_acos=.time_critical.double_acos"
+        "Relocating Opus double floor and acos to SRAM"
+)
+
+# Tier 5: whole objects whose code runs during play, so the main loop, the
+# Bluetooth stack, the radio driver, TinyUSB and their SDK helpers no longer
+# depend on the XIP cache. Boot, pairing, flash storage, bootloader
+# maintenance and the Wake-on-LAN engine stay in flash. Registered after the
+# per-function relocations above, which expect their original section names.
+function(relocate_objects_to_ram _suffixes _comment)
+    add_custom_command(TARGET ds5-bridge PRE_LINK
+            COMMAND ${CMAKE_COMMAND}
+                    "-DOBJROOT=${CMAKE_BINARY_DIR}/CMakeFiles/ds5-bridge.dir"
+                    "-DOBJCOPY=${CMAKE_OBJCOPY}"
+                    "-DOBJDUMP=${CMAKE_OBJDUMP}"
+                    "-DSUFFIXES=${_suffixes}"
+                    -P "${CMAKE_SOURCE_DIR}/cmake/relocate_objects_to_ram.cmake"
+            COMMENT "${_comment}"
+            VERBATIM
+    )
+endfunction()
+
+relocate_objects_to_ram(
+        "src/main.cpp.o@src/bt.cpp.o@src/usb.cpp.o@src/audio.cpp.o@src/watchdog_telemetry.cpp.o@src/wake_on_lan.cpp.o@src/button_functions.cpp.o@src/kitsune_button_gesture.cpp.o@src/persona/host_persona.cpp.o@src/persona/dualsense_persona.cpp.o@src/persona/ds4_persona.cpp.o@src/persona/xusb360_persona.cpp.o@src/persona/xusb360_usb.cpp.o@src/controller_packet_compositor.cpp.o@src/controller_output_policy.cpp.o@src/controller_output_rumble_state.cpp.o@src/controller_output_state.cpp.o@src/haptics_test_signal.cpp.o@src/firmware_log.cpp.o"
+        "Relocating the firmware's runtime objects to SRAM"
+)
+if(ENABLE_COMPANION)
+    relocate_objects_to_ram(
+            "src/companion.cpp.o@src/keyboard_tap_sequencer.cpp.o@src/host_bridge.cpp.o"
+            "Relocating the companion runtime objects to SRAM"
+    )
+endif()
+relocate_objects_to_ram(
+        "lib/btstack/src/hci.c.o@lib/btstack/src/hci_cmd.c.o@lib/btstack/src/l2cap.c.o@lib/btstack/src/l2cap_signaling.c.o@lib/btstack/src/btstack_util.c.o@lib/btstack/src/btstack_run_loop.c.o@lib/btstack/src/btstack_linked_list.c.o@lib/btstack/src/btstack_memory.c.o@lib/btstack/src/btstack_memory_pool.c.o@src/rp2_common/pico_btstack/btstack_run_loop_async_context.c.o"
+        "Relocating the BTstack HCI, L2CAP and run loop to SRAM"
+)
+relocate_objects_to_ram(
+        "generated/ds5-cyw43/cyw43_ll.c.o@${DS5_CYW43_CTRL_OBJECT}@generated/ds5-cyw43/cybt_shared_bus_driver.c.o@generated/ds5-cyw43/cybt_shared_bus.c.o@generated/ds5-cyw43/cyw43_bus_pio_spi.c.o@generated/ds5-cyw43/btstack_hci_transport_cyw43.c.o@src/rp2_common/pico_cyw43_driver/cyw43_driver.c.o@src/rp2_common/pico_cyw43_arch/cyw43_arch.c.o@src/rp2_common/pico_cyw43_arch/cyw43_arch_poll.c.o"
+        "Relocating the CYW43 radio driver to SRAM"
+)
+relocate_objects_to_ram(
+        "lib/tinyusb/src/tusb.c.o@lib/tinyusb/src/common/tusb_fifo.c.o@lib/tinyusb/src/device/usbd.c.o@lib/tinyusb/src/class/audio/audio_device.c.o@lib/tinyusb/src/class/hid/hid_device.c.o@lib/tinyusb/src/class/vendor/vendor_device.c.o@lib/tinyusb/src/portable/raspberrypi/rp2040/dcd_rp2040.c.o@lib/tinyusb/src/portable/raspberrypi/rp2040/rp2040_usb.c.o"
+        "Relocating the TinyUSB device stack to SRAM"
+)
+relocate_objects_to_ram(
+        "src/common/pico_time/time.c.o@src/rp2_common/hardware_timer/timer.c.o@src/rp2_common/hardware_gpio/gpio.c.o@src/rp2_common/hardware_pio/pio.c.o@src/rp2_common/hardware_watchdog/watchdog.c.o@src/rp2_common/pico_async_context/async_context_base.c.o@src/rp2_common/pico_async_context/async_context_poll.c.o@src/common/pico_sync/mutex.c.o@src/common/pico_sync/sem.c.o@src/common/pico_sync/critical_section.c.o@src/common/pico_sync/lock_core.c.o"
+        "Relocating SDK timing, GPIO, PIO, watchdog and sync helpers to SRAM"
+)
+
 # These strong RAM-resident definitions replace newlib's flash-backed memory
 # operations. Prevent the compiler from lowering their loops back into recursive
 # calls to the functions being defined.
@@ -371,8 +572,18 @@ target_compile_definitions(ds5-bridge PRIVATE
         # park core 1 while that happens.
         PICO_FLASH_ASSUME_CORE1_SAFE=0
         # Bound each CYW43/BTstack service pass so connection-event bursts
-        # cannot starve TinyUSB, audio, BOOTSEL, or the watchdog.
-        PICO_BTSTACK_CYW43_MAX_HCI_PROCESS_LOOP_COUNT=4
+        # cannot starve TinyUSB, audio, BOOTSEL, or the watchdog. Two packets
+        # is the stock SDK loop; the controller input handoff holds exactly
+        # one pass, and receive continuation reads the rest on the next poll.
+        PICO_BTSTACK_CYW43_MAX_HCI_PROCESS_LOOP_COUNT=2
+        # Put TinyUSB's RP2 IRQ path (handler, buffer start and completion) in
+        # SRAM; every input-report completion otherwise ran from flash.
+        PICO_RP2040_USB_FAST_IRQ=1
+        # Forward panic, including allocation failure, directly to the bounded
+        # reset path on either core instead of halting until the watchdog (or,
+        # before it is armed, forever).
+        PICO_PANIC_FUNCTION=ds5_runtime_panic
+        PICO_PANIC_FUNCTION_DOES_NOT_RETURN=1
         WDL_RESAMPLE_TYPE=float
         CYW43_PIO_CLOCK_DIV_INT=${CYW43_PIO_CLOCK_DIV_VALUE}
         SYS_CLOCK_KHZ=${SYS_CLOCK_KHZ_VALUE}
@@ -384,12 +595,21 @@ option(ENABLE_COMPANION "Enable the optional companion HID interface" OFF)
 if(ENABLE_COMPANION)
     target_sources(ds5-bridge PRIVATE
             src/companion.cpp
+            src/bootloader_maintenance.cpp
+            src/bootloader_authorization_flash.cpp
+            src/keyboard_tap_sequencer.cpp
             src/host_bridge.cpp
             src/usb_app_drivers.cpp
+            src/wake_on_lan_domain.cpp
+            src/wake_on_lan_engine.cpp
+            src/wake_on_lan_store.cpp
     )
     target_compile_definitions(ds5-bridge PRIVATE
             ENABLE_COMPANION
     )
+    # Bootloader authorization: HMAC-SHA256 on the RP2350 SHA block and a
+    # flash-backed enrollment record.
+    target_link_libraries(ds5-bridge pico_sha256 pico_flash hardware_flash)
 endif()
 
 # Diagnostics live in one place. Quick presets:
@@ -442,8 +662,12 @@ if(DS5_ENABLE_FIRMWARE_LOGS)
             DS5_ENABLE_DEBUG_LOGS
             DS5_DEBUG_LOGS_ENABLED=1
             PICO_DEFAULT_UART_BAUD_RATE=921600
-            PICO_STACK_SIZE=4096
     )
+else()
+    # Release builds have no stdio sink. The CYW43 driver's CYW43_PRINTF sites
+    # were the only printf callers; compiling them out drops the SDK printf
+    # implementation and its float/double formatting helpers from flash.
+    target_compile_definitions(ds5-bridge PRIVATE PICO_CYW43_LOGGING_ENABLED=0)
 endif()
 
 if(DS5_ENABLE_AUDIO_DEBUG_REPORTS)
@@ -463,6 +687,21 @@ if(DS5_ENABLE_FEEDBACK_TRACE_REPORTS)
             DS5_FEEDBACK_TRACE_ENABLED=1
     )
 endif()
+
+# Core 0 previously ran on the SDK's unguarded 2 KiB scratch stack and could
+# silently grow across both scratch banks toward the heap. Give it the final
+# 7 KiB of the contiguous scratch banks with the ARMv8-M MSPLIM guard, so an
+# overflow faults and resets through the watchdog instead of corrupting memory.
+# Core 1 keeps its dedicated guarded audio stack in main RAM.
+target_compile_definitions(ds5-bridge PRIVATE
+        PICO_STACK_SIZE=7168
+        PICO_CORE1_STACK_SIZE=0
+        PICO_USE_STACK_GUARDS=1
+)
+pico_add_linker_script_override_path(ds5-bridge
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/linker/rp2350-core0-stack"
+        FILES memory_scratch.incl section_extra_post_platform_end.incl
+)
 
 pico_set_program_name(ds5-bridge "ds5-bridge")
 pico_set_program_version(ds5-bridge "${DS5_FIRMWARE_VERSION}")
@@ -495,22 +734,38 @@ target_link_libraries(ds5-bridge
 )
 
 # The exact-capacity audio queues use static storage. Codec and resampler
-# startup still allocate 79,120 bytes; retain another 8 KiB after those known
-# allocations so a successful link cannot become an OOM boot.
-set(DS5_KNOWN_STARTUP_HEAP_BYTES 79120)
+# startup still allocate 54,872 bytes; retain another 8 KiB after those known
+# allocations so a successful link cannot become an OOM boot. The previous
+# 79,120-byte figure included the SILK encoder state (20,408 bytes) and the
+# 10 ms delay buffer (3,840 bytes) that OPUS_APPLICATION_RESTRICTED_CELT no
+# longer reserves inside the encoder.
+set(DS5_KNOWN_STARTUP_HEAP_BYTES 54872)
 set(DS5_MIN_POST_STARTUP_HEAP_BYTES 8192)
 math(EXPR DS5_MIN_RUNTIME_HEAP_BYTES
         "${DS5_KNOWN_STARTUP_HEAP_BYTES} + ${DS5_MIN_POST_STARTUP_HEAP_BYTES}"
 )
 add_custom_command(TARGET ds5-bridge POST_BUILD
         COMMAND ${CMAKE_COMMAND}
+                "-DMAP=$<TARGET_FILE:ds5-bridge>.map"
+                -P "${CMAKE_SOURCE_DIR}/cmake/verify_opus_sections.cmake"
+        COMMAND ${CMAKE_COMMAND}
+                "-DMAP=$<TARGET_FILE:ds5-bridge>.map"
+                -P "${CMAKE_SOURCE_DIR}/cmake/verify_opus_strings.cmake"
+        COMMAND ${CMAKE_COMMAND}
                 "-DNM=${CMAKE_NM}"
                 "-DELF=$<TARGET_FILE:ds5-bridge>"
+                "-DCOMPANION_ENABLED=${ENABLE_COMPANION}"
                 "-DMIN_HEAP_BYTES=${DS5_MIN_RUNTIME_HEAP_BYTES}"
                 "-DKNOWN_STARTUP_HEAP_BYTES=${DS5_KNOWN_STARTUP_HEAP_BYTES}"
                 -P "${CMAKE_SOURCE_DIR}/cmake/verify_core1_sram.cmake"
         COMMENT "Verifying complete firmware hot paths and runtime heap headroom"
         VERBATIM
+)
+set_property(TARGET ds5-bridge APPEND PROPERTY LINK_DEPENDS
+        "${CMAKE_SOURCE_DIR}/cmake/verify_opus_sections.cmake"
+        "${CMAKE_SOURCE_DIR}/cmake/opus_sections.cmake"
+        "${CMAKE_SOURCE_DIR}/cmake/verify_opus_strings.cmake"
+        "${CMAKE_SOURCE_DIR}/cmake/verify_core1_sram.cmake"
 )
 
 pico_add_extra_outputs(ds5-bridge)

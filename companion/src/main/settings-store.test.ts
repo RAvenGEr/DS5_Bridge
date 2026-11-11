@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -9,7 +9,14 @@ import {
   MAX_CHORD_FUNCTION_NAME_LENGTH
 } from '../shared/protocol';
 import type { ChordAssignment } from '../shared/protocol';
-import { DEFAULT_SETTINGS, SettingsStore } from './settings-store';
+import {
+  CURRENT_SETTINGS_SCHEMA_VERSION,
+  DEFAULT_SETTINGS,
+  SettingsStore,
+  normalizeUiLocalePreference,
+  normalizeUiScalePercent,
+  normalizeUiTextScalePercent
+} from './settings-store';
 
 describe('SettingsStore', () => {
   const tempDirs: string[] = [];
@@ -36,6 +43,22 @@ describe('SettingsStore', () => {
         rmSync(tempDir, { recursive: true, force: true });
       }
     }
+  });
+
+  it('writes settings atomically and skips rewriting unchanged settings', () => {
+    const userDataPath = tempUserDataPath();
+    const store = new SettingsStore(userDataPath);
+    const filePath = path.join(userDataPath, 'settings.json');
+    store.update({ hapticsGainPercent: 80 });
+    expect(persistedSettings(userDataPath).hapticsGainPercent).toBe(80);
+    expect(existsSync(`${filePath}.tmp`)).toBe(false);
+
+    // A marker survives an update that changes nothing.
+    writeFileSync(filePath, readFileSync(filePath, 'utf8').replace('"hapticsGainPercent": 80', '"hapticsGainPercent": 79'));
+    store.update({ hapticsGainPercent: 80 });
+    expect(persistedSettings(userDataPath).hapticsGainPercent).toBe(79);
+    store.update({ hapticsGainPercent: 70 });
+    expect(persistedSettings(userDataPath).hapticsGainPercent).toBe(70);
   });
 
   it('starts with the protected default controller profile and base settings', () => {
@@ -74,6 +97,32 @@ describe('SettingsStore', () => {
     expect(persistedSettings(userDataPath).kitsuneInputPromotionDismissed).toBe(true);
     expect(new SettingsStore(userDataPath).get().kitsuneInputPromotionDismissed).toBe(true);
     expect(store.restoreDefaults().kitsuneInputPromotionDismissed).toBe(true);
+  });
+
+  it('keeps an earlier promotion dismissal and starts existing users with the offer unshown', () => {
+    const userDataPath = tempUserDataPath();
+    writeFileSync(path.join(userDataPath, 'settings.json'), JSON.stringify({
+      settingsSchemaVersion: 5,
+      kitsuneInputPromotionDismissed: true
+    }), 'utf8');
+
+    const store = new SettingsStore(userDataPath);
+    expect(store.get().kitsuneInputPromotionDismissed).toBe(true);
+    expect(store.get().kitsuneInputLaunchOfferShown).toBe(false);
+    expect(new SettingsStore(tempUserDataPath()).get().kitsuneInputLaunchOfferShown).toBe(false);
+  });
+
+  it('keeps the one-time Kitsune Input offer shown through restarts, resets, and presets', () => {
+    const userDataPath = tempUserDataPath();
+    const store = new SettingsStore(userDataPath);
+    store.applyPreset('custom');
+
+    expect(store.update({ kitsuneInputLaunchOfferShown: true }).kitsuneInputLaunchOfferShown).toBe(true);
+    expect(persistedSettings(userDataPath).kitsuneInputLaunchOfferShown).toBe(true);
+    expect(new SettingsStore(userDataPath).get().kitsuneInputLaunchOfferShown).toBe(true);
+    expect(store.restoreDefaults().kitsuneInputLaunchOfferShown).toBe(true);
+    expect(store.applyPreset('balanced').kitsuneInputLaunchOfferShown).toBe(true);
+    expect(store.applyPreset('custom').kitsuneInputLaunchOfferShown).toBe(true);
   });
 
   it('persists the wake-on-connect preference', () => {
@@ -282,6 +331,16 @@ describe('SettingsStore', () => {
     expect(updated.showBatteryPercentTrayIcon).toBe(true);
     expect(persistedSettings(userDataPath).showBatteryPercentTrayIcon).toBe(true);
     expect(new SettingsStore(userDataPath).get().showBatteryPercentTrayIcon).toBe(true);
+  });
+
+  it('keeps the window in the tray on close unless quitting there is persisted', () => {
+    const userDataPath = tempUserDataPath();
+    const store = new SettingsStore(userDataPath);
+    expect(store.get().closeButtonQuits).toBe(false);
+
+    expect(store.update({ closeButtonQuits: true }).closeButtonQuits).toBe(true);
+    expect(persistedSettings(userDataPath).closeButtonQuits).toBe(true);
+    expect(new SettingsStore(userDataPath).get().closeButtonQuits).toBe(true);
   });
 
   it('normalizes and persists audio interleave settings', () => {
@@ -648,7 +707,9 @@ describe('SettingsStore', () => {
 
     const settings = new SettingsStore(userDataPath).get();
 
-    expect(settings.uiScalePercent).toBe(100);
+    // Unrecognized legacy scales keep the legacy default window size.
+    expect(settings.uiScalePercent).toBe(80);
+    expect(settings.uiTextScalePercent).toBe(DEFAULT_SETTINGS.uiTextScalePercent);
     expect(settings.uiThemePreset).toBe(DEFAULT_SETTINGS.uiThemePreset);
     expect(settings.lightbarColor).toBe(DEFAULT_SETTINGS.lightbarColor);
     expect(settings.speakerVolumePercent).toBe(100);
@@ -660,6 +721,68 @@ describe('SettingsStore', () => {
     expect(settings.controllerProfiles[1]?.settings.lightbarColor).toBe('#123456');
   });
 
+  it.each([
+    [75, 60],
+    [100, 80],
+    [125, 100],
+    [150, 120]
+  ])('migrates the legacy %i%% UI scale to %i%% so the window keeps its size', (legacy, migrated) => {
+    const userDataPath = tempUserDataPath();
+    writeFileSync(path.join(userDataPath, 'settings.json'), JSON.stringify({
+      settingsSchemaVersion: 4,
+      uiScalePercent: legacy,
+      customProfile: { uiScalePercent: legacy }
+    }), 'utf8');
+
+    const store = new SettingsStore(userDataPath);
+
+    expect(store.get().uiScalePercent).toBe(migrated);
+    store.update({ uiThemePreset: 'light' });
+    expect(persistedSettings(userDataPath)).toMatchObject({
+      settingsSchemaVersion: CURRENT_SETTINGS_SCHEMA_VERSION,
+      uiScalePercent: migrated
+    });
+    expect(new SettingsStore(userDataPath).get().uiScalePercent).toBe(migrated);
+  });
+
+  it('keeps the legacy default size when an old settings file has no UI scale', () => {
+    const userDataPath = tempUserDataPath();
+    writeFileSync(path.join(userDataPath, 'settings.json'), JSON.stringify({ uiThemePreset: 'kiwi' }), 'utf8');
+
+    expect(new SettingsStore(userDataPath).get().uiScalePercent).toBe(80);
+  });
+
+  it('does not migrate UI scales saved by the current schema', () => {
+    const userDataPath = tempUserDataPath();
+    writeFileSync(path.join(userDataPath, 'settings.json'), JSON.stringify({
+      settingsSchemaVersion: CURRENT_SETTINGS_SCHEMA_VERSION,
+      uiScalePercent: 100
+    }), 'utf8');
+
+    expect(new SettingsStore(userDataPath).get().uiScalePercent).toBe(100);
+  });
+
+  it('defaults new installs to the 100% scale and text size', () => {
+    const settings = new SettingsStore(tempUserDataPath()).get();
+
+    expect(settings.uiScalePercent).toBe(100);
+    expect(settings.uiTextScalePercent).toBe(100);
+  });
+
+  it('normalizes and persists the text size', () => {
+    expect(normalizeUiTextScalePercent(110)).toBe(110);
+    expect(normalizeUiTextScalePercent(95)).toBe(100);
+    expect(normalizeUiTextScalePercent('120')).toBe(100);
+    expect(normalizeUiScalePercent(75)).toBe(DEFAULT_SETTINGS.uiScalePercent);
+    expect(normalizeUiScalePercent(60)).toBe(60);
+
+    const userDataPath = tempUserDataPath();
+    const store = new SettingsStore(userDataPath);
+    store.update({ uiTextScalePercent: 120 });
+    expect(persistedSettings(userDataPath).uiTextScalePercent).toBe(120);
+    expect(new SettingsStore(userDataPath).get().uiTextScalePercent).toBe(120);
+  });
+
   it('persists the selected UI theme preset', () => {
     const userDataPath = tempUserDataPath();
     const store = new SettingsStore(userDataPath);
@@ -669,6 +792,38 @@ describe('SettingsStore', () => {
     expect(updated.uiThemePreset).toBe('kiwi');
     expect(persistedSettings(userDataPath).uiThemePreset).toBe('kiwi');
     expect(new SettingsStore(userDataPath).get().uiThemePreset).toBe('kiwi');
+  });
+
+  it('defaults the UI language to the system language and persists bundled choices', () => {
+    const userDataPath = tempUserDataPath();
+    const store = new SettingsStore(userDataPath);
+    expect(store.get().uiLocale).toBe('system');
+
+    store.update({ uiLocale: 'pt-BR' });
+    expect(persistedSettings(userDataPath).uiLocale).toBe('pt-BR');
+    expect(new SettingsStore(userDataPath).get().uiLocale).toBe('pt-BR');
+  });
+
+  it('normalizes saved UI languages to bundled catalogs or the system language', () => {
+    expect(normalizeUiLocalePreference('system')).toBe('system');
+    expect(normalizeUiLocalePreference('zh-CN')).toBe('zh-Hans');
+    expect(normalizeUiLocalePreference('es-MX')).toBe('es-419');
+    expect(normalizeUiLocalePreference('zh-TW')).toBe('system');
+    expect(normalizeUiLocalePreference('klingon')).toBe('system');
+    expect(normalizeUiLocalePreference(null)).toBe('system');
+
+    const userDataPath = tempUserDataPath();
+    writeFileSync(path.join(userDataPath, 'settings.json'), JSON.stringify({
+      settingsSchemaVersion: CURRENT_SETTINGS_SCHEMA_VERSION,
+      uiLocale: 'tlh'
+    }), 'utf8');
+    expect(new SettingsStore(userDataPath).get().uiLocale).toBe('system');
+  });
+
+  it.each(['bubble-gum', 'pomegranate', 'kiwi'] as const)('accepts the %s theme preset', (preset) => {
+    const userDataPath = tempUserDataPath();
+    new SettingsStore(userDataPath).update({ uiThemePreset: preset });
+    expect(new SettingsStore(userDataPath).get().uiThemePreset).toBe(preset);
   });
 
   it('normalizes and clones persisted bridge metadata and controller bindings', () => {

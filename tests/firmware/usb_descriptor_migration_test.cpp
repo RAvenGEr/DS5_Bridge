@@ -226,7 +226,7 @@ void assert_dualsense_persona_identity_reports_are_isolated(std::filesystem::pat
         || main_cpp.find("upstream_type == ControllerTypeDualSense") == std::string::npos
         || get_report_callback.find("report_type != HID_REPORT_TYPE_FEATURE") == std::string::npos
         || get_report_callback.find("dualsense_feature_report_may_use_bt_passthrough(active_persona, report_id)") == std::string::npos
-        || get_report_callback.find("get_feature_data(report_id, reqlen)") == std::string::npos
+        || get_report_callback.find("bt_copy_feature_data(report_id, buffer, reqlen, &copy_len)") == std::string::npos
         || get_report_callback.find("dualsense_persona_get_feature_report(active_persona, report_id, buffer, reqlen)") == std::string::npos
         || dualsense_persona_h.find("dualsense_persona_get_feature_report") == std::string::npos
         || dualsense_persona_cpp.find("kDualSenseFeatureFirmwareInfo = 0x20") == std::string::npos
@@ -248,6 +248,7 @@ void assert_dualsense_edge_persona_is_edge_facing(
     const auto companion_cpp = read_text(source_root / "src" / "companion.cpp");
     const auto host_persona_h = read_text(source_root / "src" / "persona" / "host_persona.h");
     const auto audio_cpp = read_text(source_root / "src" / "audio.cpp");
+    const auto usb_cpp = read_text(source_root / "src" / "usb.cpp");
     const auto tusb_config_h = read_text(source_root / "src" / "tusb_config.h");
 
     if (
@@ -312,12 +313,31 @@ void assert_dualsense_edge_persona_is_edge_facing(
         || source.find("build_dualsense_edge_configuration_descriptor") == std::string::npos
         || source.find("descriptor_configuration_dualsense_edge") == std::string::npos
         || source.find("source_interface == 2") == std::string::npos
-        || audio_cpp.find("host_persona_active() == HostPersonaModeDualSenseEdge ? 2 : 1") == std::string::npos
+        || usb_cpp.find("usb_mic_endpoint_channels = host_persona_active() == HostPersonaModeDualSenseEdge ? 2 : 1;")
+            == std::string::npos
+        || extract_between(usb_cpp, "extern \"C\" void tud_mount_cb(void) {", "\n}\n")
+            .find("usb_latch_mic_endpoint_channels();") == std::string::npos
+        || audio_cpp.find("return usb_mic_endpoint_channels;") == std::string::npos
         || audio_cpp.find("host_mic_usb_channel_count()") == std::string::npos
     ) {
         throw std::runtime_error(
             "DualSense Edge must expose its stereo microphone contract without changing the mono contract of other personas"
         );
+    }
+}
+
+void assert_host_microphone_mute_silences_capture(std::filesystem::path const &source_root) {
+    const auto audio_cpp = read_text(source_root / "src" / "audio.cpp");
+    const std::string pending_frame_writer = extract_between(
+        audio_cpp,
+        "bool __not_in_flash_func(write_mic_usb_pending_frame)(",
+        "\n}\n"
+    );
+    if (
+        pending_frame_writer.find("mic_output_muted || usb_host_mute[1] != 0 ? 0 : mic_output_volume_percent")
+            == std::string::npos
+    ) {
+        throw std::runtime_error("Windows microphone mute must silence captured PCM written to USB");
     }
 }
 
@@ -629,6 +649,56 @@ void assert_persona_switch_quiets_input_only(std::filesystem::path const &root) 
     ) {
         throw std::runtime_error("DS4 native probes must be able to GET_REPORT the current input report");
     }
+
+    // TinyUSB strips the ID from a control SET_REPORT(Output); the DualSense
+    // personas dropped those reports until 2.0.1.
+    if (
+        set_report_callback.find("report_type == HID_REPORT_TYPE_OUTPUT && report_id == 0x02") == std::string::npos
+        || set_report_callback.find("control_output_report[0] = report_id;") == std::string::npos
+        || set_report_callback.find("controller_output_submit_usb_payload(output_data + 1") == std::string::npos
+    ) {
+        throw std::runtime_error("DualSense personas must submit output report 0x02 sent as a control SET_REPORT");
+    }
+}
+
+// A bus already idle stays idle across a main-loop stall (Wi-Fi start during a
+// wake from S5): otherwise the first stale sample reads as the host returning
+// and the engine cancels the wake attempt before any packet is sent.
+void assert_idle_bus_survives_main_loop_stall(std::filesystem::path const &root) {
+    const auto usb_cpp = read_text(root / "src" / "usb.cpp");
+    const std::string idle = extract_between(usb_cpp, "static bool usb_bus_idle(uint32_t now) {", "\n}\n");
+    const auto hold = idle.find("if (stale && usb_sof_sampled && usb_sof_idle && frame == usb_sof_frame_seen) {");
+    const auto restart = idle.find("if (!usb_sof_sampled || stale || frame != usb_sof_frame_seen) {");
+    if (
+        hold == std::string::npos
+        || restart == std::string::npos
+        || hold > restart
+        || idle.find("usb_sof_idle = false;\n        return false;") == std::string::npos
+        || idle.find("usb_sof_idle = static_cast<uint32_t>(now - usb_sof_changed_at_us) >= USB_BUS_IDLE_US;") == std::string::npos
+    ) {
+        throw std::runtime_error("An idle USB bus must stay idle across a main-loop stall while its frame number is unchanged");
+    }
+}
+
+// The bridge's own USB re-attach (controller on or off) keeps the host session
+// it interrupted, so Wake-on-LAN's 45 s host-return count is not restarted and
+// the bridge re-arms after a wake. A BIOS session stays a BIOS session.
+void assert_bridge_reattach_keeps_host_session(std::filesystem::path const &root) {
+    const auto usb_cpp = read_text(root / "src" / "usb.cpp");
+    const std::string active = extract_between(usb_cpp, "bool usb_wake_host_active() {", "\n}\n");
+    const std::string firmware = extract_between(usb_cpp, "bool usb_wake_host_firmware() {", "\n}\n");
+    const std::string reattaching = extract_between(usb_cpp, "static bool usb_bridge_reattaching(uint32_t now) {", "\n}\n");
+    if (
+        reattaching.find("usb_reconnect_requested || usb_reconnect_connect_pending || reconnect_grace_active(now)")
+            == std::string::npos
+        || active.find("if (!usb_bridge_reattaching(time_us_32())) {") == std::string::npos
+        || active.find("usb_session_held_active = active;") == std::string::npos
+        || active.find("usb_session_held_firmware = active && usb_session_firmware;") == std::string::npos
+        || active.find("return active || usb_session_held_active;") == std::string::npos
+        || firmware.find("return usb_bridge_reattaching(time_us_32()) && usb_session_held_firmware;") == std::string::npos
+    ) {
+        throw std::runtime_error("A bridge-initiated USB re-attach must keep the host session it interrupted");
+    }
 }
 
 void assert_usb_suspend_poweroff_is_debounced(std::filesystem::path const &root) {
@@ -668,6 +738,23 @@ void assert_usb_suspend_poweroff_is_debounced(std::filesystem::path const &root)
         || pm_poll.find("if (usb_host_suspended)") == std::string::npos
     ) {
         throw std::runtime_error("USB PM poll must commit debounced power-off and defer reconnect work while suspended");
+    }
+
+    const auto retire_reconnect_wait = pm_poll.find(
+        "if (usb_reconnect_wait_pending && time_reached(now, usb_reconnect_at_us))"
+    );
+    const auto suspended_return = pm_poll.find("if (usb_host_suspended) {");
+    if (
+        retire_reconnect_wait == std::string::npos
+        || suspended_return == std::string::npos
+        || retire_reconnect_wait > suspended_return
+        || pm_poll.find("usb_reconnect_connect_pending && !usb_reconnect_wait_pending") == std::string::npos
+        || pm_poll.find("usb_reconnect_requested && !usb_reconnect_wait_pending") == std::string::npos
+        || pm_poll.find("usb_reconnect_target_bridge_only = !usb_controller_transport_ready;") == std::string::npos
+    ) {
+        throw std::runtime_error(
+            "USB PM poll must retire reconnect waits while suspended and keep a detach's reattach through controller loss"
+        );
     }
 
     const std::string disconnect_block = extract_between(
@@ -795,7 +882,10 @@ void assert_bridge_only_wake_receiver_is_persistent_and_persona_safe(std::filesy
     if (
         descriptors.find("#define BRIDGE_ONLY_VENDOR_ID 0x1209") == std::string::npos
         || descriptors.find("#define BRIDGE_ONLY_PRODUCT_ID 0xDB08") == std::string::npos
-        || descriptors.find("#define BRIDGE_ONLY_USB_BCD_DEVICE 0x0105") == std::string::npos
+        || descriptors.find("#define BRIDGE_ONLY_USB_BCD_DEVICE 0x0106") == std::string::npos
+        || descriptors.find(
+            "if (descriptor_bridge_only_active || host_persona_active() != HostPersonaModeXusb360) {\n                return NULL;"
+        ) == std::string::npos
         || descriptors.find("#define BRIDGE_ONLY_CONFIG_INTERFACE_COUNT 0x03") == std::string::npos
         || descriptors.find("descriptor_configuration_bridge_only[]") == std::string::npos
         || descriptors.find("BRIDGE_ONLY_VENDOR_BRIDGE_INTERFACE_NUMBER") == std::string::npos
@@ -808,10 +898,11 @@ void assert_bridge_only_wake_receiver_is_persistent_and_persona_safe(std::filesy
         || host_bridge_cpp.find("host_bridge_runtime_interface_number()") == std::string::npos
         || host_bridge_cpp.find("usb_descriptor_bridge_only_active()") == std::string::npos
         || host_persona_cpp.find("if (usb_descriptor_bridge_only_active())") == std::string::npos
-        || link_connected.find("if (!usb_wake_on_connect)") == std::string::npos
+        || link_connected.find("if (!usb_wake_on_connect || !wake_on_lan_allow_usb_wake())") == std::string::npos
         || link_connected.find("usb_remote_wakeup_pending = true;") == std::string::npos
         || link_connected.find("tud_remote_wakeup") != std::string::npos
-        || pm_poll.find("if (usb_remote_wakeup_pending)") == std::string::npos
+        || pm_poll.find("if (usb_remote_wakeup_pending || qualified_wake)") == std::string::npos
+        || pm_poll.find("(qualified_wake || wake_on_lan_allow_usb_wake())") == std::string::npos
         || pm_poll.find("usb_wake_on_connect") == std::string::npos
         || pm_poll.find("usb_remote_wakeup_armed") == std::string::npos
         || pm_poll.find("usb_bus_suspended()") == std::string::npos
@@ -830,6 +921,25 @@ void assert_bridge_only_wake_receiver_is_persistent_and_persona_safe(std::filesy
     ) {
         throw std::runtime_error(
             "The serialized bridge-only receiver must remain manageable, gate remote wake, and hand off safely to the full persona"
+        );
+    }
+}
+
+void assert_mute_keyboard_shortcut_is_typed_in_stages(std::filesystem::path const &root) {
+    const auto companion_cpp = read_text(root / "src" / "companion.cpp");
+    const std::string loop_block = extract_between(companion_cpp, "void mute_keyboard_loop() {", "\n}\n");
+    if (
+        companion_cpp.find("ds5::KeyboardTapSequencer mute_keyboard_taps;") == std::string::npos
+        || companion_cpp.find("mute_keyboard_taps.enqueue(report, hold);") == std::string::npos
+        || companion_cpp.find("mute_keyboard_taps.release();") == std::string::npos
+        || loop_block.find("mute_keyboard_taps.next_report(now, ready, report)") == std::string::npos
+        || loop_block.find("mute_keyboard_taps.accept_report(now);") == std::string::npos
+        || loop_block.find("mute_keyboard_taps.cancel();") == std::string::npos
+        || loop_block.find("keyboard_hid_instance < CFG_TUD_HID && tud_hid_n_ready(keyboard_hid_instance)")
+            == std::string::npos
+    ) {
+        throw std::runtime_error(
+            "The mute-button shortcut must be typed in stages and never index past TinyUSB's HID instances"
         );
     }
 }
@@ -925,20 +1035,39 @@ void assert_mute_keyboard_chord_starter_is_deferred(std::filesystem::path const 
     }
 }
 
+void assert_mute_button_reaches_host_only_in_normal_mode(std::filesystem::path const &root) {
+    const auto companion_cpp = read_text(root / "src" / "companion.cpp");
+    const std::string process_block = extract_between(
+        companion_cpp,
+        "void companion_process_controller_report(uint8_t *report, uint16_t len) {",
+        "\n}\n\nvoid companion_update_controller_report"
+    );
+    const auto guard_pos = process_block.find("if (mute_button_mode != MuteButtonNormal) {\n        report[9] &= static_cast<uint8_t>(~kMuteButtonBit);\n    }");
+    const auto toggle_pos = process_block.find("toggle_companion_mic_mute();");
+    if (guard_pos == std::string::npos || toggle_pos == std::string::npos || toggle_pos < guard_pos) {
+        throw std::runtime_error("Normal mute mode must pass the mute button to the host and still toggle the bridge mic (GitHub #140)");
+    }
+    if (process_block.find("\n    report[9] &= static_cast<uint8_t>(~kMuteButtonBit);") != std::string::npos) {
+        throw std::runtime_error("The mute button must not be stripped from host reports unconditionally (GitHub #140)");
+    }
+}
+
 void assert_ps_chord_starter_is_deferred_to_protect_steam_big_picture(std::filesystem::path const &root) {
     const auto companion_cpp = read_text(root / "src" / "companion.cpp");
+    const auto gate_h = read_text(root / "src" / "home_chord_gate.h");
 
-    if (companion_cpp.find("constexpr uint32_t kHomeChordSuppressUs = 250000;") == std::string::npos) {
+    // Timing behavior itself is covered by home_chord_gate_test.
+    if (gate_h.find("inline constexpr uint32_t kSuppressUs = 250000;") == std::string::npos) {
         throw std::runtime_error("PS/Home chord starter must be swallowed for the full 250ms chord window");
     }
-    if (companion_cpp.find("constexpr uint32_t kHomeChordFallbackReplayUs = 80000;") == std::string::npos) {
+    if (gate_h.find("inline constexpr uint32_t kFallbackReplayUs = 80000;") == std::string::npos) {
         throw std::runtime_error("Unconsumed PS/Home taps must replay as a host-visible 80ms press");
     }
 
     const std::string gate_enabled_block = extract_between(
         companion_cpp,
         "bool home_chord_gate_enabled() {",
-        "\n}\n\nvoid clear_home_chord_gate"
+        "\n}\n\nvoid apply_home_chord_gate"
     );
     if (
         gate_enabled_block.find("sleep_keybind_enabled || speaker_volume_shortcut_enabled") == std::string::npos
@@ -953,14 +1082,13 @@ void assert_ps_chord_starter_is_deferred_to_protect_steam_big_picture(std::files
         "\n}\n\nbool dpad_direction_has"
     );
     if (
-        gate_block.find("if (home_chord_consumed)") == std::string::npos
+        gate_block.find("ds5::home_chord_gate::step(") == std::string::npos
+        || gate_block.find("home_chord_gate_enabled(),") == std::string::npos
+        || gate_block.find("home_chord_consumed,") == std::string::npos
+        || gate_block.find("report[9] |= kHomeButtonBit;") == std::string::npos
         || gate_block.find("report[9] &= static_cast<uint8_t>(~kHomeButtonBit);") == std::string::npos
-        || gate_block.find("home_chord_gate_until_us = now + kHomeChordSuppressUs;") == std::string::npos
-        || gate_block.find("if (!time_us_reached(now, home_chord_gate_until_us))") == std::string::npos
-        || gate_block.find("home_chord_replay_until_us = now + kHomeChordFallbackReplayUs;") == std::string::npos
-        || gate_block.find("if (home_chord_replay_until_us != 0 && !time_us_reached(now, home_chord_replay_until_us))") == std::string::npos
     ) {
-        throw std::runtime_error("PS/Home chord gate must mask PS/Home during the chord window and replay unconsumed taps by duration");
+        throw std::runtime_error("PS/Home chord gate must decide the host's PS/Home bit from the shared gate state machine");
     }
 
     const std::string dynamic_block = extract_between(
@@ -1267,7 +1395,7 @@ void assert_bluetooth_pairing_and_reconnect_policy(std::filesystem::path const &
     const std::string finish_hid = extract_between(
         bt_cpp,
         "static void finish_hid_session_if_ready() {",
-        "\n}\n\nstatic __attribute__((optimize(\"O2\"))) void __not_in_flash_func(handle_l2cap_can_send_now)"
+        "\n}\n\nstatic __attribute__((noinline, noclone, optimize(\"O2\"))) void __not_in_flash_func(handle_l2cap_can_send_now)"
     );
     const auto transaction_accept =
         link_key_notification.find("mark_pairing_transaction_key_accepted(addr)");
@@ -1486,7 +1614,7 @@ void assert_bluetooth_device_management_policy(std::filesystem::path const &root
     const std::string finish_hid = extract_between(
         bt_cpp,
         "static void finish_hid_session_if_ready() {",
-        "\n}\n\nstatic __attribute__((optimize(\"O2\"))) void __not_in_flash_func(handle_l2cap_can_send_now)"
+        "\n}\n\nstatic __attribute__((noinline, noclone, optimize(\"O2\"))) void __not_in_flash_func(handle_l2cap_can_send_now)"
     );
     const auto durable_key_gate =
         finish_hid.find("pairing_link_key_required && !current_link_key_persisted");
@@ -1517,9 +1645,9 @@ void assert_companion_device_management_contract(std::filesystem::path const &ro
     const auto protocol_ts = read_text(root / "companion" / "src" / "shared" / "protocol.ts");
 
     if (
-        companion_cpp.find("constexpr uint8_t kProtocolMinor = 23;")
+        companion_cpp.find("constexpr uint8_t kProtocolMinor = 24;")
             == std::string::npos
-        || protocol_ts.find("export const PROTOCOL_MINOR = 23;")
+        || protocol_ts.find("export const PROTOCOL_MINOR = 24;")
             == std::string::npos
         || companion_cpp.find("constexpr uint8_t kAudioHapticsSessionProtocolMinor = 23;")
             == std::string::npos
@@ -1785,8 +1913,8 @@ void assert_dualsense_feature_startup_is_paced(std::filesystem::path const &root
             == std::string::npos
         || init_feature_block.find("schedule_feature_prefetch(0x20, 64);")
             == std::string::npos
-        || init_feature_block.find("get_feature_data(") != std::string::npos
-        || prefetch_loop.find("get_feature_data(request.report_id, request.len)")
+        || init_feature_block.find("request_feature_report_if_needed(") != std::string::npos
+        || prefetch_loop.find("request_feature_report_if_needed(request.report_id)")
             == std::string::npos
         || prefetch_loop.find("FEATURE_PREFETCH_SPACING_US") == std::string::npos
         || main_cpp.find("bt_feature_prefetch_loop();") == std::string::npos
@@ -1832,9 +1960,10 @@ void assert_watchdog_and_bootsel_flash_safety(std::filesystem::path const &root)
             != std::string::npos
         || cmake.find(".text._ZN13WDL_Resampler5ResetEd=.time_critical.WDL_Reset")
             == std::string::npos
-        || cmake.find("target_compile_options(opus PRIVATE -O2)") == std::string::npos
+        || cmake.find("target_compile_options(opus PRIVATE -O2 -ffunction-sections -fdata-sections)")
+            == std::string::npos
         || cmake.find("\"-DOBJDUMP=${CMAKE_OBJDUMP}\"") == std::string::npos
-        || cmake.find("set(DS5_KNOWN_STARTUP_HEAP_BYTES 79120)")
+        || cmake.find("set(DS5_KNOWN_STARTUP_HEAP_BYTES 54872)")
             == std::string::npos
         || cmake.find("set(DS5_MIN_POST_STARTUP_HEAP_BYTES 8192)")
             == std::string::npos
@@ -1852,7 +1981,9 @@ void assert_watchdog_and_bootsel_flash_safety(std::filesystem::path const &root)
         || audio_cpp.find("ExactAudioQueue<mic_packet_element, HOST_MIC_QUEUE_DEPTH> mic_fifo")
             == std::string::npos
         || audio_cpp.find("if (!did_speaker && !did_mic)") == std::string::npos
-        || audio_cpp.find("sleep_us(10);") == std::string::npos
+        || audio_cpp.find("sleep_us(10);") != std::string::npos
+        || audio_cpp.find("while (static_cast<uint32_t>(time_us_32() - sleep_start_us) < 10u) {")
+            == std::string::npos
         || audio_cpp.find(
             "static bool __not_in_flash_func(process_usb_audio_packet)() {"
         ) == std::string::npos
@@ -1889,12 +2020,41 @@ void assert_watchdog_and_bootsel_flash_safety(std::filesystem::path const &root)
         || verify_cmake.find("_Z24usb_mic_streaming_activev") == std::string::npos
         || verify_cmake.find("tud_audio_n_available") == std::string::npos
         || verify_cmake.find("tud_audio_n_get_ep_in_ff") == std::string::npos
-        || cmake.find("PICO_BTSTACK_CYW43_MAX_HCI_PROCESS_LOOP_COUNT=4")
+        || cmake.find("PICO_BTSTACK_CYW43_MAX_HCI_PROCESS_LOOP_COUNT=2")
             == std::string::npos
         || cmake.find("PICO_FLASH_ASSUME_CORE1_SAFE=0") == std::string::npos
     ) {
         throw std::runtime_error(
             "Firmware build must bound CYW43 event bursts and retain multicore flash safety"
+        );
+    }
+
+    const auto runtime_fail_fast_cpp = read_text(root / "src" / "runtime_fail_fast.cpp");
+    if (
+        audio_cpp.find("opus_encoder_create(48000,2,OPUS_APPLICATION_RESTRICTED_CELT,&error)")
+            == std::string::npos
+        || audio_cpp.find("OPUS_APPLICATION_AUDIO") != std::string::npos
+        || cmake.find("set(OPUS_STACK_PROTECTOR OFF CACHE BOOL") == std::string::npos
+        || cmake.find("target_compile_definitions(opus PRIVATE OVERRIDE_celt_fatal)")
+            == std::string::npos
+        || cmake.find("cmake/opus_fatal_override.h") == std::string::npos
+        || cmake.find("cmake/relocate_opus_sections.cmake") == std::string::npos
+        || cmake.find("cmake/verify_opus_sections.cmake") == std::string::npos
+        || cmake.find("cmake/verify_opus_strings.cmake") == std::string::npos
+        || cmake.find(".time_critical.opus_strings") != std::string::npos
+        || cmake.find("\"LINKER:--wrap=silk_Encode\"") == std::string::npos
+        || cmake.find("\"LINKER:--wrap=silk_InitEncoder\"") == std::string::npos
+        || cmake.find("\"LINKER:--wrap=run_analysis\"") == std::string::npos
+        || cmake.find("\"LINKER:--wrap=tonality_analysis_init\"") == std::string::npos
+        || cmake.find("\"LINKER:--wrap=tonality_analysis_reset\"") == std::string::npos
+        || cmake.find("\"LINKER:--wrap=tonality_get_info\"") == std::string::npos
+        || runtime_fail_fast_cpp.find("void ds5_celt_fatal_noargs()") == std::string::npos
+        || runtime_fail_fast_cpp.find("void __wrap_silk_Encode()") == std::string::npos
+        || runtime_fail_fast_cpp.find("void __wrap_run_analysis()") == std::string::npos
+        || runtime_fail_fast_cpp.find("watchdog_enable(0, false);") == std::string::npos
+    ) {
+        throw std::runtime_error(
+            "The speaker encoder must stay CELT-only with the SILK encoder, tonality analysis and Opus diagnostic strings retired from SRAM"
         );
     }
 
@@ -1947,8 +2107,23 @@ void assert_watchdog_and_bootsel_flash_safety(std::filesystem::path const &root)
     const auto audio_init = main_cpp.find("if (!audio_init())");
     const auto bt_init = main_cpp.find("bt_init();", audio_init);
     const auto watchdog_start = main_cpp.find("watchdog_enable(1000, true);", bt_init);
-    const auto first_poll = main_cpp.find("cyw43_arch_poll();", watchdog_start);
-    const auto first_poll_feed = main_cpp.find("watchdog_update();", first_poll);
+    // Every main-loop phase, including each Bluetooth poll, runs inside
+    // RUN_MAIN_PHASE, whose expansion feeds the watchdog after the phase.
+    const auto first_poll_phase = main_cpp.find(
+        "RUN_MAIN_PHASE(WatchdogMainLoopPhase::Cyw43, {",
+        watchdog_start
+    );
+    const auto first_poll = main_cpp.find("poll_bluetooth_once();", watchdog_start);
+    const std::string run_main_phase = extract_between(
+        main_cpp,
+        "#define RUN_MAIN_PHASE(phase_id, block)",
+        "} while (0)"
+    );
+    const auto first_poll_feed = run_main_phase.find("watchdog_update();") != std::string::npos
+        && first_poll_phase != std::string::npos
+        && first_poll_phase < first_poll
+        ? first_poll
+        : std::string::npos;
     const auto next_usb_phase = main_cpp.find("tud_task();", first_poll);
     const auto button_check = main_cpp.find("button_check();", first_poll_feed);
     const std::string reboot_branch = extract_between(
@@ -2208,13 +2383,14 @@ void assert_companion_trigger_tests_survive_continuous_audio(
             == std::string::npos
         || state_submit.find("enqueue_feedback_state_output")
             == std::string::npos
-        || standard_test.find("adaptive_trigger_motor_power_for_intensity")
+        || standard_test.find("ds5::trigger_power::trigger_motor_power_from_percent(intensity_percent)")
             == std::string::npos
         || standard_test.find("queue_adaptive_trigger_state_report")
             == std::string::npos
         || standard_test.find("bt_write(") != std::string::npos
-        || custom_test.find("queue_adaptive_trigger_state_report(report, 0)")
+        || custom_test.find("queue_adaptive_trigger_state_report(report, motor_power)")
             == std::string::npos
+        || companion_cpp.find("persistent_trigger_motor_power()") == std::string::npos
         || custom_test.find("bt_write(") != std::string::npos
         || companion_cpp.find("bool replay_cached_game_trigger_effect(")
             == std::string::npos
@@ -2291,11 +2467,110 @@ void assert_dualsense_battery_buckets_preserve_power_state(
         decoder.find("dualsense_battery::decode_status(report[52])") == std::string::npos
         || companion.find("dualsense_battery::decode_status(report[52])") == std::string::npos
         || battery.find("case kPowerFull:") == std::string::npos
-        || battery.find("reading.percent = 100;") == std::string::npos
+        || battery.find("reading.percent = 100;") != std::string::npos
         || battery.find("kUnknownPercent = 0xff") == std::string::npos
     ) {
         throw std::runtime_error(
-            "DualSense battery decoding must centralize full, fault, and unknown power-state semantics"
+            "DualSense battery decoding must centralize power-state semantics and keep capacity on external power"
+        );
+    }
+}
+
+void assert_bluetooth_input_is_handed_off_after_the_poll(std::filesystem::path const &root) {
+    const auto main_cpp = read_text(root / "src" / "main.cpp");
+    const auto usb_cpp = read_text(root / "src" / "usb.cpp");
+    const auto xusb_usb_cpp = read_text(root / "src" / "persona" / "xusb360_usb.cpp");
+
+    const std::string receive = extract_between(
+        main_cpp,
+        "void on_bt_data(CHANNEL_TYPE channel, uint8_t *data, uint16_t len) {",
+        "\n}\n"
+    );
+    const std::string poll = extract_between(
+        main_cpp,
+        "static void poll_bluetooth_once() {",
+        "\n}\n"
+    );
+    const std::string reset = extract_between(
+        main_cpp,
+        "void reset_controller_input_report_cache() {",
+        "\n}\n"
+    );
+    const std::string persona_switch = extract_between(
+        main_cpp,
+        "void host_input_prepare_persona_switch() {",
+        "\n}\n"
+    );
+    const std::string completion = extract_between(
+        usb_cpp,
+        "void tud_hid_report_complete_cb(",
+        "\n}\n"
+    );
+    const auto drain_after = [&](std::size_t poll_position) {
+        const auto drain = main_cpp.find("drain_controller_input_batch(true);", poll_position);
+        const auto next_poll = main_cpp.find("poll_bluetooth_once();", poll_position + 1);
+        return drain != std::string::npos && (next_poll == std::string::npos || drain < next_poll);
+    };
+    const auto loop_start = main_cpp.find("watchdog_enable(1000, true);");
+    const auto first_poll = main_cpp.find("poll_bluetooth_once();", loop_start);
+    const auto second_poll = first_poll == std::string::npos
+        ? std::string::npos
+        : main_cpp.find("poll_bluetooth_once();", first_poll + 1);
+    if (
+        receive.find("controller_input_receive_batch.push(data + 3)") == std::string::npos
+        || receive.find("companion_process_controller_report") != std::string::npos
+        || receive.find("dualsense_decode_usb_input_report") != std::string::npos
+        || poll.find("drain_controller_input_batch(false);") == std::string::npos
+        || poll.find("drain_controller_input_batch(false);") > poll.find("cyw43_arch_poll();")
+        || main_cpp.find("PICO_BTSTACK_CYW43_MAX_HCI_PROCESS_LOOP_COUNT == ControllerInputReceiveBatch::capacity()")
+            == std::string::npos
+        || first_poll == std::string::npos
+        || second_poll == std::string::npos
+        || !drain_after(first_poll)
+        || !drain_after(second_poll)
+        || main_cpp.find("if (!controller_input_receive_batch.current(packet))") == std::string::npos
+        || main_cpp.find("const bool received_input_pending = !controller_input_receive_batch.empty();")
+            == std::string::npos
+        || main_cpp.find("ds5::controller_input_refresh_analog_sticks(safe_state, interrupt_in_state);")
+            == std::string::npos
+        || reset.find("controller_input_receive_batch.clear();") == std::string::npos
+        || reset.find("clear_host_input_delivery();") == std::string::npos
+        || persona_switch.find("controller_input_receive_batch.clear();") == std::string::npos
+        || persona_switch.find("clear_host_input_delivery();") == std::string::npos
+        || completion.find("instance == 0 && host_persona_is_native_hid()") == std::string::npos
+        || completion.find("host_input_report_complete();") == std::string::npos
+        || xusb_usb_cpp.find("        xusb_in_busy = false;\n        host_input_report_complete();")
+            == std::string::npos
+    ) {
+        throw std::runtime_error(
+            "Bluetooth input must be staged during the poll, drained with USB service between reports, and chained from IN completions"
+        );
+    }
+}
+
+void assert_runtime_objects_run_from_sram(std::filesystem::path const &root) {
+    const auto cmake = read_text(root / "CMakeLists.txt");
+    const auto relocate_cmake = read_text(root / "cmake" / "relocate_objects_to_ram.cmake");
+    const auto verify_cmake = read_text(root / "cmake" / "verify_core1_sram.cmake");
+    const auto per_function = cmake.find("src/rp2_common/pico_double/double_math.c.o");
+    const auto whole_object = cmake.find("relocate_objects_to_ram(\n        \"src/main.cpp.o@src/bt.cpp.o@");
+    if (
+        per_function == std::string::npos
+        || whole_object == std::string::npos
+        || whole_object < per_function
+        || cmake.find("src/companion.cpp.o@") == std::string::npos
+        || cmake.find("\"lib/btstack/src/hci.c.o@") == std::string::npos
+        || cmake.find("\"generated/ds5-cyw43/cyw43_ll.c.o@${DS5_CYW43_CTRL_OBJECT}@") == std::string::npos
+        || cmake.find("lib/tinyusb/src/device/usbd.c.o@") == std::string::npos
+        || cmake.find("src/rp2_common/hardware_pio/pio.c.o@") == std::string::npos
+        || relocate_cmake.find("still has flash code") == std::string::npos
+        || relocate_cmake.find("\"@${response_file}\"") == std::string::npos
+        || verify_cmake.find("        \"main\"\n") == std::string::npos
+        || verify_cmake.find("\"cyw43_ll_has_work\"") == std::string::npos
+        || verify_cmake.find("\"pio_sm_set_pindirs_with_mask64\"") == std::string::npos
+    ) {
+        throw std::runtime_error(
+            "The main loop, Bluetooth stack, radio driver and USB stack must be relocated whole to SRAM after the per-function relocations"
         );
     }
 }
@@ -2312,14 +2587,19 @@ int main() {
         assert_persona_support_requires_verified_descriptors(source, source_root);
         assert_dualsense_persona_identity_reports_are_isolated(source_root);
         assert_dualsense_edge_persona_is_edge_facing(source, source_root);
+        assert_host_microphone_mute_silences_capture(source_root);
         assert_selected_polling_rate_is_applied_to_every_persona_descriptor(source, source_root);
         assert_xusb_persona_strings_are_xbox_facing(source);
         assert_ds4_persona_identity_is_ds4_facing(source);
         assert_persona_switch_quiets_input_only(source_root);
         assert_usb_suspend_poweroff_is_debounced(source_root);
+        assert_idle_bus_survives_main_loop_stall(source_root);
+        assert_bridge_reattach_keeps_host_session(source_root);
         assert_bridge_only_wake_receiver_is_persistent_and_persona_safe(source_root);
         assert_mute_keyboard_chord_starter_is_deferred(source_root);
+        assert_mute_keyboard_shortcut_is_typed_in_stages(source_root);
         assert_ps_chord_starter_is_deferred_to_protect_steam_big_picture(source_root);
+        assert_mute_button_reaches_host_only_in_normal_mode(source_root);
         assert_mic_pass_through_defaults_to_enabled(source_root);
         assert_bluetooth_pairing_and_reconnect_policy(source_root);
         assert_firmware_version_has_one_canonical_source(source_root);
@@ -2334,6 +2614,8 @@ int main() {
         assert_companion_trigger_tests_survive_continuous_audio(source_root);
         assert_lightbar_restore_can_be_disabled(source_root);
         assert_dualsense_battery_buckets_preserve_power_state(source_root);
+        assert_bluetooth_input_is_handed_off_after_the_poll(source_root);
+        assert_runtime_objects_run_from_sram(source_root);
 
         if (bcd_device != kExpectedUsbDeviceRevision) {
             std::cerr << "USB bcdDevice changed unexpectedly. Expected 0x" << std::hex

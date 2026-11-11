@@ -11,6 +11,7 @@
 #include "dualsense_output.h"
 #include "haptics_test_signal.h"
 #include "persona/host_persona.h"
+#include "runtime_fail_fast.h"
 #include "usb_audio_render_gain.h"
 #ifdef ENABLE_COMPANION
 #include "companion.h"
@@ -18,6 +19,7 @@
 #include "resample.h"
 #include "tusb.h"
 #include "usb.h"
+#include "wake_on_lan.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -132,7 +134,9 @@ struct mic_decode_element {
 };
 
 static uint8_t host_mic_usb_channel_count() {
-    return host_persona_active() == HostPersonaModeDualSenseEdge ? 2 : 1;
+    // Follow the attached descriptor, not a persona change still waiting for
+    // its USB reconnect (DualSense Edge exposes a stereo microphone).
+    return usb_mic_endpoint_channels;
 }
 
 static uint16_t host_mic_usb_packet_bytes() {
@@ -254,6 +258,9 @@ static uint8_t audio_reactive_haptics_response = AudioReactiveHapticsResponseBal
 static uint8_t audio_reactive_haptics_attack = AudioReactiveHapticsAttackBalanced;
 static uint8_t audio_reactive_haptics_release = AudioReactiveHapticsReleaseBalanced;
 static bool audio_reactive_haptics_suppress_classic_rumble = false;
+// Set from the SRAM audio path when Replace takes ownership; the held-rumble
+// state is cleared from audio_loop instead of inside that path.
+static volatile bool audio_haptics_replace_rumble_clear_pending = false;
 static float audio_reactive_haptics_filter_l = 0.0f;
 static float audio_reactive_haptics_filter_r = 0.0f;
 static float audio_reactive_haptics_env_l = 0.0f;
@@ -804,7 +811,7 @@ static void __no_inline_not_in_flash_func(audio_core1_stack_poll)(uint32_t now) 
 
     for (uint32_t word : audio_core1_stack_storage.guard) {
         if (word != AUDIO_CORE1_STACK_CANARY) {
-            panic("audio Core 1 stack overflow");
+            runtime_fail_fast(WatchdogResetReason::AudioStackOverflow);
         }
     }
 
@@ -937,12 +944,24 @@ void audio_reactive_haptics_reset() {
 }
 
 static void refresh_audio_haptics_replace_policy() {
+    const bool replace_was_active = controller_output_policy_audio_haptics_replace_active();
     controller_output_policy_set_audio_haptics_replace_requested(
         audio_reactive_haptics_suppress_classic_rumble
     );
-    controller_output_policy_set_audio_haptics_replace_producer_active(
-        audio_reactive_haptics_config_enabled
-    );
+    if (!replace_was_active && controller_output_policy_audio_haptics_replace_active()) {
+        controller_output_state_clear_classic_rumble();
+    }
+}
+
+// Replace suppresses game rumble only while a producer keeps delivering
+// frames; a stalled capture must not leave the controller silent. Taking
+// ownership also drops any held game rumble so it is not replayed by carriers.
+static void __not_in_flash_func(note_audio_haptics_producer_frame)(uint32_t now) {
+    const bool replace_was_active = controller_output_policy_audio_haptics_replace_active();
+    (void)controller_output_policy_note_audio_haptics_producer_frame(now);
+    if (!replace_was_active && controller_output_policy_audio_haptics_replace_active()) {
+        audio_haptics_replace_rumble_clear_pending = true;
+    }
 }
 
 bool audio_set_reactive_haptics_config(
@@ -967,7 +986,8 @@ bool audio_set_reactive_haptics_config(
         return false;
     }
 
-    const bool changed = audio_reactive_haptics_config_enabled != enabled
+    const bool producer_path_changed = audio_reactive_haptics_config_enabled != enabled;
+    const bool changed = producer_path_changed
         || audio_haptics_session_config_active != session_active
         || audio_reactive_haptics_mode != mode
         || audio_reactive_haptics_gain_percent != gain_percent
@@ -985,6 +1005,9 @@ bool audio_set_reactive_haptics_config(
     audio_reactive_haptics_attack = attack;
     audio_reactive_haptics_release = release;
     audio_reactive_haptics_suppress_classic_rumble = suppress_classic_rumble;
+    if (!session_active || producer_path_changed) {
+        controller_output_policy_reset_audio_haptics_producer();
+    }
     refresh_audio_haptics_replace_policy();
     if (changed) {
         audio_reactive_haptics_reset();
@@ -1025,6 +1048,8 @@ void audio_handle_controller_disconnect() {
     controller_output_state_reset_cached_triggers();
     controller_output_state_reset_cached_player_leds();
     controller_output_state_clear_classic_rumble();
+    controller_output_policy_reset_audio_haptics_producer();
+    audio_haptics_replace_rumble_clear_pending = false;
     plug_headset = false;
     controller_state_ready = false;
     host_route_primer_toggle_pending = false;
@@ -1038,7 +1063,7 @@ void audio_handle_controller_disconnect() {
     last_audio_us = 0;
 }
 
-static bool should_keep_speaker_route_open() {
+static bool __not_in_flash_func(should_keep_speaker_route_open)() {
     return bt_is_controller_connected() && controller_state_ready && volume[0] > 0.0f;
 }
 
@@ -1269,6 +1294,9 @@ static void process_bridge_audio_frame(uint8_t const *frame) {
         return;
     }
 
+    if (audio_haptics_session_config_active) {
+        note_audio_haptics_producer_frame(time_us_32());
+    }
     int8_t haptic_buf[SAMPLE_SIZE]{};
     memcpy(haptic_buf, frame, SAMPLE_SIZE);
     if (send_audio_haptics_packet(haptic_buf, speaker_route_active, false)) {
@@ -1716,6 +1744,7 @@ void audio_set_quiet_mode(bool enabled) {
     test_haptics_preroll_packets_remaining = 0;
     test_haptics_packets_remaining = 0;
     test_haptics_neutral_packets_remaining = 0;
+    controller_output_policy_reset_audio_haptics_producer();
     drain_audio_queues();
     clear_partial_audio_state();
     bt_set_speaker_output_enabled(false);
@@ -1732,7 +1761,7 @@ void audio_set_quiet_mode(bool enabled) {
     );
 }
 
-bool audio_quiet_mode_enabled() {
+bool __not_in_flash_func(audio_quiet_mode_enabled)() {
     return quiet_mode_enabled;
 }
 
@@ -1887,6 +1916,16 @@ void audio_debug_get_stats(audio_debug_stats *stats) {
 }
 
 void audio_test_haptics_loop() {
+    // Retire an elapsed cooldown on every pass. Left in place, it would read
+    // as future again once the signed clock difference wraps (~36 minutes),
+    // refusing Test Haptics for up to as long again.
+    if (
+        test_haptics_cooldown_until_us != 0
+        && time_reached(time_us_32(), test_haptics_cooldown_until_us)
+    ) {
+        test_haptics_cooldown_until_us = 0;
+    }
+
     if (quiet_mode_enabled) {
         return;
     }
@@ -1897,6 +1936,7 @@ void audio_test_haptics_loop() {
 
     int8_t haptic_buf[SAMPLE_SIZE]{};
     if (merge_test_haptics_overlay(haptic_buf, false)) {
+        note_audio_haptics_producer_frame(time_us_32());
         send_audio_haptics_packet(haptic_buf, speaker_route_active, false);
     }
 }
@@ -1914,6 +1954,9 @@ static bool __not_in_flash_func(process_usb_audio_packet)() {
         return false;
     }
     audio_stats_note_usb_read(now);
+    if (audio_reactive_haptics_config_enabled) {
+        note_audio_haptics_producer_frame(now);
+    }
     if (last_audio_us == 0) {
         audio_debug_packet_log_budget = 4;
         audio_debug_log(
@@ -1934,6 +1977,14 @@ static bool __not_in_flash_func(process_usb_audio_packet)() {
     const int haptic_input_frames = std::min(frames, requested_haptic_frames);
     const float speaker_gain = usb_host_mute[0] ? 0.0f : clamp(volume[0], 0.0f, 1.0f);
     const float haptic_gain = clamp(volume[1], 0.0f, MAX_HAPTICS_GAIN);
+    // Zero speaker volume, or a controller that has not reported its headset
+    // state yet, keeps the speaker route closed. Sending speaker payloads anyway
+    // reopened the route on every packet while update_persistent_speaker_route
+    // closed it again on every pass. Audio haptics still flow without it.
+    const bool speaker_route_demanded = should_keep_speaker_route_open();
+    if (!speaker_route_demanded) {
+        audio_buf_pos = 0;
+    }
     // Windows sends USB Audio volume controls for this endpoint instead of pre-scaling PCM.
     const float host_render_gain = clamp(usb_host_speaker_gain, 0.0f, 1.0f);
     for (int i = 0; i < frames; i++) {
@@ -1950,8 +2001,10 @@ static bool __not_in_flash_func(process_usb_audio_packet)() {
         const int16_t speaker_r = rendered.speaker_right;
         const int16_t haptic_l = rendered.haptic_left;
         const int16_t haptic_r = rendered.haptic_right;
-        audio_buf[audio_buf_pos++] = static_cast<float>(speaker_l) / 32768.0f * speaker_gain;
-        audio_buf[audio_buf_pos++] = static_cast<float>(speaker_r) / 32768.0f * speaker_gain;
+        if (speaker_route_demanded) {
+            audio_buf[audio_buf_pos++] = static_cast<float>(speaker_l) / 32768.0f * speaker_gain;
+            audio_buf[audio_buf_pos++] = static_cast<float>(speaker_r) / 32768.0f * speaker_gain;
+        }
         if (audio_buf_pos == 512 * 2) {
             static audio_raw_element element{};
             memcpy(element.data,audio_buf,512 * 2 * 4);
@@ -1996,7 +2049,7 @@ static bool __not_in_flash_func(process_usb_audio_packet)() {
     const int out_frames = resampler.ResampleOut(out_buf, haptic_input_frames, SAMPLE_SIZE / OUTPUT_CHANNELS, OUTPUT_CHANNELS);
     for (int i = 0; i < out_frames; i++) {
         if (append_resampled_haptic_sample(out_buf[i * OUTPUT_CHANNELS], out_buf[i * OUTPUT_CHANNELS + 1], haptic_gain)) {
-            send_audio_haptics_packet(audio_haptic_buf, speaker_route_active);
+            send_audio_haptics_packet(audio_haptic_buf, speaker_route_demanded);
         }
     }
     return true;
@@ -2174,7 +2227,9 @@ static __attribute__((noinline, noclone)) bool __not_in_flash_func(write_mic_usb
     const uint8_t *data = reinterpret_cast<uint8_t const *>(mic_usb_pending.data) + mic_usb_pending_offset;
     alignas(2) uint8_t scaled_data[HOST_MIC_USB_PACKET_BYTES_MAX]{};
     uint8_t const *write_data = data;
-    const uint8_t output_percent = mic_output_muted ? 0 : mic_output_volume_percent;
+    // Windows mutes the microphone through the UAC feature unit, independent
+    // of the companion mute (which also drives the controller's mute LED).
+    const uint8_t output_percent = mic_output_muted || usb_host_mute[1] != 0 ? 0 : mic_output_volume_percent;
     if (output_percent < 100) {
         const int16_t *samples = reinterpret_cast<int16_t const *>(data);
         int16_t *scaled_samples = reinterpret_cast<int16_t *>(scaled_data);
@@ -2318,9 +2373,18 @@ void audio_mic_add_packet(uint8_t const *data, uint16_t len) {
 }
 
 void __not_in_flash_func(audio_loop)() {
+    // Wi-Fi owns the shared CYW43 bus while Wake-on-LAN runs.
+    if (wake_on_lan_quiet_gate()) {
+        return;
+    }
     const uint32_t now = time_us_32();
     AudioLoopTelemetryScope loop_telemetry(now);
     audio_core1_stack_poll(now);
+    if (audio_haptics_replace_rumble_clear_pending) {
+        audio_haptics_replace_rumble_clear_pending = false;
+        controller_output_state_clear_classic_rumble();
+    }
+    (void)controller_output_policy_poll_audio_haptics_producer(now);
     process_mic_usb_output();
 
     if (!bt_is_controller_connected()) {
@@ -2623,7 +2687,12 @@ static bool __not_in_flash_func(core1_process_speaker)() {
         in_buf[i] = audio_element.data[i];
     }
     static WDL_ResampleSample out_buf[480 * 2];
-    resampler_audio.ResampleOut(out_buf,nframes,480,2);
+    const int output_frames = resampler_audio.ResampleOut(out_buf, nframes, 480, 2);
+    // WDL can return fewer than 480 frames, for example on the first block
+    // after a reset. Never feed the encoder samples left from the last block.
+    if (output_frames < 480) {
+        std::fill(out_buf + std::max(0, output_frames) * 2, out_buf + 480 * 2, 0.0f);
+    }
     static uint8_t encoded[SPEAKER_OPUS_SIZE];
 #if DS5_AUDIO_TRANSPORT_STATS_ENABLED
     const uint32_t encode_start_us = time_us_32();
@@ -2664,6 +2733,9 @@ static bool __not_in_flash_func(core1_process_speaker)() {
 
 static void __not_in_flash_func(core1_entry)() {
     int error = 0;
+    // Restricted CELT is the mode this bitrate always selected; the restricted
+    // application also skips the SILK encoder state and the 10 ms delay buffer,
+    // and the link retires the SILK encoder code entirely.
     encoder = opus_encoder_create(48000,2,OPUS_APPLICATION_RESTRICTED_CELT,&error);
     if (error != OPUS_OK) {
         DS5_LOG("[Audio] OpusEncoder create failed\n");
@@ -2720,7 +2792,12 @@ static void __not_in_flash_func(core1_entry)() {
         }
         if (!did_speaker && !did_mic) {
             const uint32_t sleep_start_us = time_us_32();
-            sleep_us(10);
+            // Spin rather than sleep_us(): every sleep arms a hardware alarm whose
+            // interrupts land on core 0, about 180k per second while core 1 idles.
+            // Interrupts stay enabled, so multicore flash lockout still works.
+            while (static_cast<uint32_t>(time_us_32() - sleep_start_us) < 10u) {
+                tight_loop_contents();
+            }
             core1_sleep_us += static_cast<uint32_t>(time_us_32() - sleep_start_us);
         }
         const uint32_t now_us = time_us_32();

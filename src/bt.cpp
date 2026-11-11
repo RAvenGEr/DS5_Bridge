@@ -10,13 +10,11 @@
 
 #include "bt.h"
 
-#include <deque>
-#include <queue>
-#include <unordered_map>
 #include <utility>
-#include <vector>
 
 #include "audio.h"
+#include "bounded_containers.h"
+#include "bt_output_send_dispatcher.h"
 #include "classic_rumble_delivery_policy.h"
 #include "controller_packet_compositor.h"
 #include "controller_output_policy.h"
@@ -24,6 +22,7 @@
 #include "controller_output_state.h"
 #include "dualsense_output.h"
 #include "output_scheduler.h"
+#include "trigger_motor_power.h"
 #ifdef ENABLE_COMPANION
 #include "companion.h"
 #endif
@@ -36,6 +35,7 @@
 #include "pico/stdio.h"
 #include "usb.h"
 #include "utils.h"
+#include "wake_on_lan.h"
 #include "bsp/board_api.h"
 #include "hardware/watchdog.h"
 #include "pico/sync.h"
@@ -163,10 +163,6 @@
     } \
 } while (0)
 
-using std::unordered_map;
-using std::vector;
-using std::queue;
-using std::deque;
 
 enum OutputPacketClass : uint8_t {
     OutputPacketUrgent = 1,
@@ -241,8 +237,17 @@ enum class HidConnectionInitiator : uint8_t {
     Remote,
 };
 
-struct output_packet {
-    vector<uint8_t> data;
+// Queued interrupt reports are framed DualSense output reports (0xA2 + the
+// 78-byte report). The single in-flight send packet must also carry the
+// largest framed audio report.
+#define OUTPUT_QUEUED_PACKET_MAX_SIZE (DS_OUTPUT_REPORT_BT_SIZE + 1)
+#define CONTROL_PACKET_MAX_SIZE 64
+#define FEATURE_CACHE_MAX_ENTRIES 32
+#define FEATURE_CACHE_MAX_REPORT_SIZE 80
+
+template <std::size_t Capacity>
+struct basic_output_packet {
+    ds5::InlineBytes<Capacity> data;
     uint32_t enqueue_time_us;
     uint32_t ready_at_us;
     uint8_t packet_class;
@@ -253,7 +258,28 @@ struct output_packet {
     uint8_t trace_detail1;
     uint8_t trace_detail2;
     uint8_t trace_detail3;
+
+    template <std::size_t OtherCapacity>
+    [[nodiscard]] bool copy_from(basic_output_packet<OtherCapacity> const &other) {
+        if (!data.assign(other.data.data(), other.data.size())) {
+            return false;
+        }
+        enqueue_time_us = other.enqueue_time_us;
+        ready_at_us = other.ready_at_us;
+        packet_class = other.packet_class;
+        report_id = other.report_id;
+        reason = other.reason;
+        retry_count = other.retry_count;
+        trace_detail0 = other.trace_detail0;
+        trace_detail1 = other.trace_detail1;
+        trace_detail2 = other.trace_detail2;
+        trace_detail3 = other.trace_detail3;
+        return true;
+    }
 };
+
+using output_packet = basic_output_packet<OUTPUT_QUEUED_PACKET_MAX_SIZE>;
+using output_send_packet = basic_output_packet<AUDIO_INTERRUPT_PACKET_MAX_SIZE>;
 
 struct audio_output_packet {
     std::array<uint8_t, AUDIO_INTERRUPT_PACKET_MAX_SIZE> data{};
@@ -305,10 +331,16 @@ private:
 };
 
 struct control_packet {
-    vector<uint8_t> data;
+    ds5::InlineBytes<CONTROL_PACKET_MAX_SIZE> data;
     uint32_t enqueue_time_us;
     uint8_t report_id;
     bool coalescible;
+};
+
+struct feature_cache_entry {
+    bool valid;
+    uint8_t report_id;
+    ds5::InlineBytes<FEATURE_CACHE_MAX_REPORT_SIZE> data;
 };
 
 struct feature_prefetch_request {
@@ -353,9 +385,15 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
 static void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 static void l2cap_packet_handler_cold(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 static int classic_connection_filter(bd_addr_t addr, hci_link_type_t link_type);
-static bool build_interrupt_output_packet(uint8_t *data, uint16_t len, vector<uint8_t> &packet);
-static bool prepare_interrupt_output_packet_for_send(output_packet &packet);
-static void commit_interrupt_output_packet_sent(output_packet const &packet);
+// Always inlined: the scheduler frames coalesced state reports from SRAM.
+template <std::size_t Capacity>
+static inline __attribute__((always_inline)) bool build_interrupt_output_packet(
+    uint8_t *data,
+    uint16_t len,
+    ds5::InlineBytes<Capacity> &packet
+);
+static bool prepare_interrupt_output_packet_for_send(output_send_packet &packet);
+static void commit_interrupt_output_packet_sent(output_send_packet const &packet);
 static bool enqueue_urgent_output(uint8_t *data, uint16_t len, uint8_t reason);
 static bool enqueue_state_output(uint8_t *data, uint16_t len, uint8_t reason);
 static bool enqueue_feedback_state_output(uint8_t *data, uint16_t len, uint8_t reason);
@@ -372,7 +410,10 @@ static bool audio_send_window_closed_locked(uint32_t now);
 static void request_control_if_audio_window_open_locked(uint32_t now, bool &should_request_control);
 static void finish_hid_session_if_ready();
 static void init_state_report(uint8_t *report);
-static bool select_next_output_packet_locked(output_packet &packet, uint32_t now);
+static bool select_next_output_packet_locked(output_send_packet &packet, uint32_t now);
+static void clear_feature_cache();
+static bool store_feature_report(uint8_t report_id, uint8_t const *data, uint16_t len);
+static void request_feature_report_if_needed(uint8_t report_id);
 static bool audio_output_route_protected();
 static bool output_report_payload(
     uint8_t const *data,
@@ -408,6 +449,15 @@ static bool pairing_authorized_session = false;
 static bool pairing_link_key_required = false;
 static bool current_link_key_persisted = false;
 static bool pairing_transaction_recovery_failed = false;
+// Wake-on-LAN: the last incoming page, and the scan suspension that must be
+// read back from the controller before Wi-Fi may start.
+static uint64_t wake_last_connection_request_ms = 0;
+static bool wake_radio_quiet_requested = false;
+static bool wake_radio_scan_confirmed = false;
+static bool wake_radio_scan_read_pending = false;
+static bool wake_radio_scan_read_stale = false;
+// HCI Read Scan Enable (Core specification, OGF 0x03 / OCF 0x0019).
+static const hci_cmd_t wake_read_scan_enable = {0x0c19, ""};
 static hci_con_handle_t acl_handle = HCI_CON_HANDLE_INVALID;
 static uint16_t hid_control_cid;
 static uint16_t hid_interrupt_cid;
@@ -448,15 +498,16 @@ static uint64_t bt_rssi_idle_epoch = 0;
 static uint64_t bt_rssi_pending_epoch = 0;
 static uint64_t bt_rssi_last_activity_us = 0;
 static uint64_t bt_rssi_last_request_us = 0;
-unordered_map<uint8_t, vector<uint8_t> > feature_data;
+// Last feature report received per report ID (including the ID byte).
+static std::array<feature_cache_entry, FEATURE_CACHE_MAX_ENTRIES> feature_cache{};
 static feature_prefetch_request feature_prefetch_queue[FEATURE_PREFETCH_MAX_REQUESTS]{};
 static uint8_t feature_prefetch_count = 0;
 static uint8_t feature_prefetch_index = 0;
 static uint32_t feature_prefetch_next_us = 0;
-static deque<output_packet> urgent_queue;
+static ds5::BoundedDeque<output_packet, URGENT_SEND_QUEUE_HARD_MAX_DEPTH> urgent_queue;
 static fixed_audio_output_queue audio_queue;
-static output_packet interrupt_send_packet;
-static vector<control_packet> control_queue;
+static output_send_packet interrupt_send_packet;
+static ds5::BoundedDeque<control_packet, CONTROL_SEND_QUEUE_MAX_DEPTH> control_queue;
 static uint8_t state_pending_report[DS_OUTPUT_REPORT_BT_SIZE];
 static bool state_pending = false;
 static uint32_t state_pending_since_us = 0;
@@ -469,6 +520,8 @@ static uint8_t consecutive_non_audio_sends = 0;
 static uint8_t consecutive_audio_sends = 0;
 static uint8_t consecutive_classic_rumble_stop_sends = 0;
 static bool interrupt_can_send_event_requested = false;
+static ds5::bt::BtOutputSendDispatcher output_send_dispatcher;
+static __attribute__((noinline, noclone, optimize("O2"))) void __not_in_flash_func(pump_output_sends)();
 static critical_section_t queue_lock;
 uint64_t inactive_time = 0; // Tracks long controller inactivity without 32-bit timer wrap.
 static uint16_t idle_disconnect_timeout_minutes = DEFAULT_IDLE_DISCONNECT_TIMEOUT_MINUTES;
@@ -480,6 +533,9 @@ static bool player_led_enabled = true;
 static bool lightbar_restore_enabled = true;
 static bool lightbar_restore_pending = false;
 static uint32_t lightbar_restore_at_us = 0;
+// The game set a visible lightbar color this connection and has not since
+// released or blanked it. Routine settings refreshes then only save a color.
+static bool host_lightbar_owned = false;
 static uint8_t state_report_seq = 0;
 static bool edge_profile_switching_blocked = false;
 static bool edge_profile_switching_mode_applied = false;
@@ -496,13 +552,7 @@ static void update_max_u32(uint32_t &current, uint32_t candidate) {
     }
 }
 
-static void clear_packet_queue(queue<output_packet> &packets) {
-    while (!packets.empty()) {
-        packets.pop();
-    }
-}
-
-static void clear_packet_queue(deque<output_packet> &packets) {
+static void clear_packet_queue(decltype(urgent_queue) &packets) {
     packets.clear();
 }
 
@@ -524,6 +574,7 @@ static void clear_output_queues_locked() {
     consecutive_audio_sends = 0;
     consecutive_classic_rumble_stop_sends = 0;
     interrupt_can_send_event_requested = false;
+    output_send_dispatcher.reset_pending();
     non_audio_reports_since_audio = 0;
     last_bt_send_us = 0;
     last_audio_0x36_send_us = 0;
@@ -541,6 +592,7 @@ static void reset_controller_output_session_locked() {
     speaker_output_headset_route = false;
     lightbar_restore_pending = false;
     lightbar_restore_at_us = 0;
+    host_lightbar_owned = false;
 }
 
 static bool output_pending_locked() {
@@ -1407,7 +1459,8 @@ static void restore_passive_reconnect_scan() {
         && !pairing_window_active
         && !inquiry_active
         && !acl_connection_pending
-        && acl_handle == HCI_CON_HANDLE_INVALID;
+        && acl_handle == HCI_CON_HANDLE_INVALID
+        && !wake_radio_quiet_requested;
     gap_connectable_control(reconnect_allowed ? 1 : 0);
     gap_discoverable_control(0);
     gap_set_bondable_mode(
@@ -1456,6 +1509,7 @@ static void start_inquiry_if_needed() {
         || device_found
         || acl_connection_pending
         || acl_handle != HCI_CON_HANDLE_INVALID
+        || wake_radio_quiet_requested
     ) {
         return;
     }
@@ -1546,6 +1600,12 @@ static bool classic_acl_connection_allowed(bd_addr_t addr, bool log_reject) {
 }
 
 static int classic_connection_filter(bd_addr_t addr, hci_link_type_t link_type) {
+    wake_last_connection_request_ms = to_us_since_boot(get_absolute_time()) / 1000;
+    // A controller still retrying after sleep cannot establish the quiet
+    // interval Wake-on-LAN needs to arm. It must stop paging first.
+    if (wake_on_lan_preparing()) {
+        return 0;
+    }
     return link_type == HCI_LINK_TYPE_ACL && classic_acl_connection_allowed(addr, true);
 }
 
@@ -1575,7 +1635,7 @@ static uint8_t output_trace_selected_flag(uint8_t packet_class) {
 }
 
 static void set_output_trace_details_locked(
-    output_packet &packet,
+    output_send_packet &packet,
     uint32_t now,
     uint8_t critical_depth,
     uint8_t audio_depth,
@@ -1587,7 +1647,7 @@ static void set_output_trace_details_locked(
     packet.trace_detail3 = clamp_output_trace_u8(packet_age_us(now, packet.enqueue_time_us) / 1000);
 }
 
-static void __not_in_flash_func(output_trace_queue_details_locked)(
+static __attribute__((noinline, noclone)) void __not_in_flash_func(output_trace_queue_details_locked)(
     uint8_t &critical_depth,
     uint8_t &audio_depth,
     uint8_t &route_flags
@@ -1880,15 +1940,6 @@ static void set_trigger_vibration(uint8_t *trigger, uint8_t position, uint8_t am
     trigger[9] = frequency;
 }
 
-static uint8_t adaptive_trigger_motor_power_for_intensity(uint8_t intensity_percent) {
-    if (intensity_percent == 0 || intensity_percent >= 100) {
-        return 0;
-    }
-    const uint8_t clamped = intensity_percent > 100 ? 100 : intensity_percent;
-    const uint8_t reduction = static_cast<uint8_t>(((100 - clamped) * 8 + 50) / 100);
-    return std::min<uint8_t>(reduction, 7);
-}
-
 static void queue_adaptive_trigger_state_report(uint8_t *report, uint8_t motor_power) {
     uint8_t *payload = report + 3;
     payload[OUTPUT_PAYLOAD_VALID_FLAG1_OFFSET] |= DS_OUTPUT_VALID_FLAG1_MOTOR_POWER_LEVEL_ENABLE;
@@ -1950,7 +2001,7 @@ void bt_set_adaptive_trigger_effect(uint8_t mode, uint8_t intensity_percent, uin
     }
     queue_adaptive_trigger_state_report(
         report,
-        adaptive_trigger_motor_power_for_intensity(intensity_percent)
+        ds5::trigger_power::trigger_motor_power_from_percent(intensity_percent)
     );
 }
 
@@ -1989,7 +2040,8 @@ void bt_set_custom_adaptive_trigger_effects(
     uint8_t left_start_percent,
     uint8_t left_wall_percent,
     uint8_t left_force_percent,
-    bool left_active
+    bool left_active,
+    uint8_t motor_power
 ) {
     if (hid_interrupt_cid == 0) {
         return;
@@ -2008,7 +2060,7 @@ void bt_set_custom_adaptive_trigger_effects(
         ? set_custom_trigger_effect(left_trigger, left_mode, left_start_percent, left_wall_percent, left_force_percent)
         : set_trigger_off(left_trigger);
 
-    queue_adaptive_trigger_state_report(report, 0);
+    queue_adaptive_trigger_state_report(report, motor_power);
 }
 
 void bt_set_custom_adaptive_trigger_effect(
@@ -2030,7 +2082,8 @@ void bt_set_custom_adaptive_trigger_effect(
         start_percent,
         wall_percent,
         force_percent,
-        left_active
+        left_active,
+        0
     );
 }
 
@@ -2099,10 +2152,8 @@ void bt_set_lightbar_color(uint8_t red, uint8_t green, uint8_t blue, uint8_t bri
     uint8_t report[DS_OUTPUT_REPORT_BT_SIZE];
     init_state_report(report);
     report[3 + 1] = DS_OUTPUT_VALID_FLAG1_LIGHTBAR_CONTROL_ENABLE;
-    if (!player_led_enabled) {
-        report[3 + 1] |= DS_OUTPUT_VALID_FLAG1_PLAYER_INDICATOR_CONTROL_ENABLE;
-        report[3 + 43] = 0;
-    }
+    // Off, the host's pattern, or player 1 until the host sets one.
+    controller_output_state_copy_player_led_report(report + 3, DS_OUTPUT_REPORT_COMMON_SIZE);
     report[3 + OUTPUT_PAYLOAD_LED_BRIGHTNESS_OFFSET] = 0x01;
     report[3 + 44] = scale_lightbar_channel(saved_lightbar_red, saved_lightbar_brightness);
     report[3 + 45] = scale_lightbar_channel(saved_lightbar_green, saved_lightbar_brightness);
@@ -2265,6 +2316,28 @@ void bt_schedule_lightbar_restore(uint32_t delay_ms) {
     lightbar_restore_at_us = time_us_32() + delay_ms * 1000;
 }
 
+void bt_note_host_lightbar_set() {
+    host_lightbar_owned = true;
+    // A restore scheduled when the game blanked the lightbar is stale once the
+    // game sets a new color; firing it would overwrite that color.
+    lightbar_restore_pending = false;
+}
+
+void bt_note_host_lightbar_released() {
+    host_lightbar_owned = false;
+}
+
+bool bt_host_lightbar_owned() {
+    return host_lightbar_owned;
+}
+
+void bt_save_lightbar_color(uint8_t red, uint8_t green, uint8_t blue, uint8_t brightness_percent) {
+    saved_lightbar_red = red;
+    saved_lightbar_green = green;
+    saved_lightbar_blue = blue;
+    saved_lightbar_brightness = brightness_percent > 100 ? 100 : brightness_percent;
+}
+
 void bt_lightbar_loop() {
     if (!lightbar_restore_enabled || !lightbar_restore_pending || hid_interrupt_cid == 0) {
         return;
@@ -2385,16 +2458,24 @@ bool bt_power_off_controller() {
         return false;
     }
 
+    // The controller ends the link itself. Once the request is sent or
+    // queued, record the drop as an expected sleep, as the ACL path does.
     const uint8_t status = l2cap_send(hid_control_cid, set_feature, sizeof(set_feature));
     if (status != 0) {
         DS5_LOG("[L2CAP] Power-off feature send failed status=0x%02X\n", status);
-        enqueue_control_packet(set_feature, sizeof(set_feature), false);
+        if (enqueue_control_packet(set_feature, sizeof(set_feature), false)) {
+            controller_disconnect_intent = BtControllerDisconnectIntentSleep;
+        }
         return false;
     }
+    controller_disconnect_intent = BtControllerDisconnectIntentSleep;
     return true;
 }
 
 bool bt_request_scan() {
+    if (wake_radio_quiet_requested || wake_on_lan_quiet_gate()) {
+        return false;
+    }
     if (pairing_transaction_recovery_failed) {
         if (!recover_pairing_transaction_on_boot()) {
             DS5_LOG("[HCI] Pairing transaction recovery still incomplete; scan denied\n");
@@ -2465,7 +2546,7 @@ bool bt_forget_pairings() {
     pairing_transaction_recovery_failed = false;
     stored_link_key_present = false;
     current_link_key_persisted = false;
-    feature_data.clear();
+    clear_feature_cache();
     clear_feature_prefetch_queue();
 
     return bt_request_scan();
@@ -2509,7 +2590,7 @@ bool bt_forget_pairing(uint8_t address[6]) {
     stored_link_key_present = bt_has_stored_link_key();
     if (targets_current_session) {
         current_link_key_persisted = false;
-        feature_data.clear();
+        clear_feature_cache();
         clear_feature_prefetch_queue();
         if (acl_handle != HCI_CON_HANDLE_INVALID || hid_interrupt_ready) {
             (void)bt_disconnect();
@@ -2781,7 +2862,7 @@ void bt_feature_prefetch_loop() {
     }
 
     const feature_prefetch_request request = feature_prefetch_queue[feature_prefetch_index++];
-    (void)get_feature_data(request.report_id, request.len);
+    request_feature_report_if_needed(request.report_id);
     feature_prefetch_next_us = time_us_32() + FEATURE_PREFETCH_SPACING_US;
 }
 
@@ -2812,6 +2893,7 @@ void bt_output_retry_loop() {
     }
 
     bool retry_ready = false;
+    bool control_ready = false;
     const uint32_t now = time_us_32();
     critical_section_enter_blocking(&queue_lock);
     const bool audio_queued = !audio_queue.empty();
@@ -2820,12 +2902,74 @@ void bt_output_retry_loop() {
     retry_ready = audio_queued
         || urgent_ready
         || (state_pending && urgent_queue.empty());
+    // Control wakeups deferred by the send dispatcher, or by an earlier audio
+    // window, are rediscovered here as well as interrupt work.
+    request_control_if_audio_window_open_locked(now, control_ready);
     critical_section_exit(&queue_lock);
     request_can_send_if_needed(retry_ready);
+    request_control_can_send_if_needed(control_ready);
+}
+
+bool bt_wake_controllers_quiet() {
+    return acl_handle == HCI_CON_HANDLE_INVALID
+        && !acl_connection_pending
+        && !device_found
+        && !pairing_window_active
+        && !inquiry_active
+        && !hid_control_ready
+        && !hid_interrupt_ready
+        && (wake_last_connection_request_ms == 0
+            || to_us_since_boot(get_absolute_time()) / 1000 - wake_last_connection_request_ms >= 5000);
+}
+
+void bt_set_wake_radio_quiet(bool quiet) {
+    if (wake_radio_quiet_requested == quiet) {
+        return;
+    }
+    wake_radio_quiet_requested = quiet;
+    wake_radio_scan_confirmed = false;
+    if (wake_radio_scan_read_pending) {
+        wake_radio_scan_read_stale = true;
+    }
+    if (quiet) {
+        // The passive reconnect scan has a 100% duty cycle. Suspend scanning
+        // during WLAN work without disconnecting a connected controller.
+        gap_connectable_control(0);
+        gap_discoverable_control(0);
+        if (inquiry_active) {
+            gap_inquiry_stop();
+        }
+    } else {
+        restore_passive_reconnect_scan();
+    }
+}
+
+bool bt_wake_radio_ready() {
+    return wake_radio_quiet_requested && wake_radio_scan_confirmed && !inquiry_active;
+}
+
+void bt_quiesce_gameplay_output() {
+    critical_section_enter_blocking(&queue_lock);
+    reset_controller_output_session_locked();
+    critical_section_exit(&queue_lock);
 }
 
 void bt_inquiry_loop() {
     service_acl_connection_cancel();
+    if (
+        wake_radio_quiet_requested
+        && !wake_radio_scan_confirmed
+        && !wake_radio_scan_read_pending
+        && hci_can_send_command_packet_now()
+    ) {
+        // Read back the controller's actual scan state after the queued GAP
+        // writes. A request to stop scanning is not evidence enough for WLAN.
+        wake_radio_scan_read_pending = true;
+        wake_radio_scan_read_stale = false;
+        if (hci_send_cmd(&wake_read_scan_enable) != ERROR_CODE_SUCCESS) {
+            wake_radio_scan_read_pending = false;
+        }
+    }
 
     const uint32_t now = time_us_32();
     if (
@@ -2894,9 +3038,6 @@ void bt_inquiry_loop() {
 
 int bt_init() {
     critical_section_init(&queue_lock);
-    // Allocate the reusable interrupt packet before streaming starts so the
-    // steady-state CAN_SEND_NOW handler never enters the flash-backed heap.
-    interrupt_send_packet.data.reserve(AUDIO_INTERRUPT_PACKET_MAX_SIZE);
 
     bt_l2cap_init();
     gap_set_link_supervision_timeout(CLASSIC_LINK_SUPERVISION_TIMEOUT_SLOTS);
@@ -3212,6 +3353,15 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
         case HCI_EVENT_COMMAND_COMPLETE: {
             const uint8_t status = hci_event_command_complete_get_return_parameters(packet)[0];
             const uint16_t opcode = hci_event_command_complete_get_command_opcode(packet);
+            if (opcode == wake_read_scan_enable.opcode && wake_radio_scan_read_pending) {
+                wake_radio_scan_read_pending = false;
+                // Return parameters: status, then Scan_Enable (0 = no scans).
+                wake_radio_scan_confirmed = wake_radio_quiet_requested
+                    && !wake_radio_scan_read_stale
+                    && size >= 7
+                    && status == ERROR_CODE_SUCCESS
+                    && hci_event_command_complete_get_return_parameters(packet)[1] == 0;
+            }
             DS5_LOG("[HCI] CmdComplete %s(0x%04X) status=0x%02X\n", opcode_to_str(opcode), opcode, status);
             break;
         }
@@ -3504,7 +3654,9 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             hci_event_connection_request_get_bd_addr(packet, addr);
             const uint32_t cod = hci_event_connection_request_get_class_of_device(packet);
             DS5_LOG("[HCI] Incoming ACL request from %s cod=0x%06x\n", bd_addr_to_str(addr), (unsigned int) cod);
-            if (classic_acl_connection_allowed(addr, false)) {
+            // Mirrors classic_connection_filter: pages it declined while
+            // Wake-on-LAN prepares must not start a connection session.
+            if (!wake_on_lan_preparing() && classic_acl_connection_allowed(addr, false)) {
                 if (!begin_connection_attempt()) {
                     break;
                 }
@@ -3553,6 +3705,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
                         disconnected_handle);
                 break;
             }
+            wake_on_lan_controller_disconnected(connection_generation);
             const BtControllerDisconnectIntent disconnect_intent =
                 controller_disconnect_intent;
             const bool expected_disconnect =
@@ -3591,7 +3744,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             hid_connection_initiator = HidConnectionInitiator::None;
             hid_control_opened_at_us = 0;
             audio_handle_controller_disconnect();
-            feature_data.clear();
+            clear_feature_cache();
             clear_feature_prefetch_queue();
             controller_type = ControllerTypeUnknown;
             controller_type_check_pending = false;
@@ -3639,7 +3792,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
 }
 
 static __attribute__((noinline, noclone, optimize("O2"))) void __not_in_flash_func(note_output_packet_sent)(
-    const output_packet &packet,
+    const output_send_packet &packet,
     uint32_t now
 ) {
     const uint32_t age_us = packet_age_us(now, packet.enqueue_time_us);
@@ -3716,7 +3869,7 @@ static __attribute__((noinline, noclone, optimize("O2"))) void __not_in_flash_fu
 }
 
 static __attribute__((noinline, noclone, optimize("O2"))) bool __not_in_flash_func(select_next_output_packet_locked)(
-    output_packet &packet,
+    output_send_packet &packet,
     uint32_t now
 ) {
     if (!output_pending_locked()) {
@@ -3743,7 +3896,8 @@ static __attribute__((noinline, noclone, optimize("O2"))) bool __not_in_flash_fu
         // Match Awalol/DS5Dongle's shared FIFO: host 0x31 and audio 0x39
         // reports drain in arrival order. Retry readiness still prevents a
         // delayed urgent head from blocking newer audio indefinitely.
-        packet = std::move(urgent_queue.front());
+        // Queued reports always fit the larger in-flight send buffer.
+        (void)packet.copy_from(urgent_queue.front());
         urgent_queue.pop_front();
     } else {
         const bool audio_available = audio_queued;
@@ -3769,10 +3923,7 @@ static __attribute__((noinline, noclone, optimize("O2"))) bool __not_in_flash_fu
 
         if (choice == OutputSchedulerChoice::AudioStream) {
             const audio_output_packet &audio_packet = audio_queue.front();
-            packet.data.assign(
-                audio_packet.data.begin(),
-                audio_packet.data.begin() + audio_packet.data_size
-            );
+            (void)packet.data.assign(audio_packet.data.data(), audio_packet.data_size);
             packet.enqueue_time_us = audio_packet.enqueue_time_us;
             packet.ready_at_us = audio_packet.enqueue_time_us;
             packet.packet_class = OutputPacketAudio;
@@ -3781,7 +3932,7 @@ static __attribute__((noinline, noclone, optimize("O2"))) bool __not_in_flash_fu
             packet.retry_count = 0;
             audio_queue.pop();
         } else if (choice == OutputSchedulerChoice::Urgent) {
-            packet = std::move(urgent_queue.front());
+            (void)packet.copy_from(urgent_queue.front());
             urgent_queue.pop_front();
         } else if (choice == OutputSchedulerChoice::CoalescedState) {
             uint8_t report[DS_OUTPUT_REPORT_BT_SIZE];
@@ -3820,8 +3971,8 @@ static bool select_next_control_packet_locked(control_packet &packet, uint32_t n
         return false;
     }
 
-    packet = std::move(control_queue.front());
-    control_queue.erase(control_queue.begin());
+    packet = control_queue.front();
+    control_queue.pop_front();
     audio_debug_note_bt_event(
         BtAudioDebugControlSend,
         packet.data.empty() ? 0 : packet.data[0],
@@ -3850,7 +4001,7 @@ static uint64_t idle_disconnect_timeout_us() {
 }
 
 static bool requeue_managed_rumble_on_send_failure(
-    output_packet &&packet,
+    output_send_packet &packet,
     uint32_t now
 ) {
     const auto delivery_kind = classic_rumble_delivery_kind(packet.reason);
@@ -3876,6 +4027,11 @@ static bool requeue_managed_rumble_on_send_failure(
 
     packet.ready_at_us = now
         + ds5::classic_rumble::retry_delay_us(packet.retry_count);
+    // Urgent reports were queued at their framed size, so they always fit.
+    output_packet retry{};
+    if (!retry.copy_from(packet)) {
+        return false;
+    }
     critical_section_enter_blocking(&queue_lock);
     if (urgent_queue.size() >= URGENT_SEND_QUEUE_HARD_MAX_DEPTH) {
         critical_section_exit(&queue_lock);
@@ -3888,7 +4044,7 @@ static bool requeue_managed_rumble_on_send_failure(
     }
     ds5::classic_rumble::requeue_failed_front(
         urgent_queue,
-        std::move(packet)
+        std::move(retry)
     );
     critical_section_exit(&queue_lock);
     return true;
@@ -3923,6 +4079,15 @@ static void finish_hid_session_if_ready() {
     critical_section_enter_blocking(&queue_lock);
     reset_controller_output_session_locked();
     critical_section_exit(&queue_lock);
+    // Only a reconnect of an already bonded controller, encrypted with its
+    // stored key, may wake the PC; a new pairing never qualifies.
+    wake_on_lan_controller_connected(
+        connection_generation,
+        !pairing_authorized_session
+            && current_link_key_persisted
+            && gap_security_level(acl_handle) >= LEVEL_2,
+        !pairing_authorized_session
+    );
 
     if (!mute[0]) {
         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, true);
@@ -3942,7 +4107,7 @@ static void finish_hid_session_if_ready() {
     bt_schedule_lightbar_restore(250);
 }
 
-static __attribute__((optimize("O2"))) void __not_in_flash_func(handle_l2cap_can_send_now)(uint8_t *packet) {
+static __attribute__((noinline, noclone, optimize("O2"))) void __not_in_flash_func(handle_l2cap_can_send_now)(uint8_t *packet) {
     if (connection_phase == BtConnectionPhase::Disconnecting) {
         return;
     }
@@ -3987,7 +4152,7 @@ static __attribute__((optimize("O2"))) void __not_in_flash_func(handle_l2cap_can
             }
             critical_section_exit(&queue_lock);
         }
-        if (requeue_managed_rumble_on_send_failure(std::move(interrupt_send_packet), now)) {
+        if (requeue_managed_rumble_on_send_failure(interrupt_send_packet, now)) {
             // The failed transition remains at the head until its bounded
             // backoff expires. Audio may continue meanwhile.
             critical_section_enter_blocking(&queue_lock);
@@ -4023,21 +4188,45 @@ static __attribute__((optimize("O2"))) void __not_in_flash_func(handle_l2cap_can
     request_control_can_send_if_needed(should_request_control);
 }
 
-static void __not_in_flash_func(l2cap_packet_handler)(
+// Keep admission outside the large handler frames: an already-armed other CID
+// can be notified during synchronous HCI buffer release. It must only record a
+// pending wakeup, without selecting a packet or allocating another send frame.
+static __attribute__((noinline, noclone, optimize("O2"))) void __not_in_flash_func(l2cap_packet_handler)(
     uint8_t packet_type,
     uint16_t channel,
     uint8_t *packet,
     uint16_t size
 ) {
-    if (
-        packet_type == HCI_EVENT_PACKET
-        && hci_event_packet_get_type(packet) == L2CAP_EVENT_CAN_SEND_NOW
-        && l2cap_event_can_send_now_get_local_cid(packet) == hid_interrupt_cid
-    ) {
-        handle_l2cap_can_send_now(packet);
+    const bool send_opportunity = packet_type == HCI_EVENT_PACKET
+        && hci_event_packet_get_type(packet) == L2CAP_EVENT_CAN_SEND_NOW;
+    if (!send_opportunity) {
+        l2cap_packet_handler_cold(packet_type, channel, packet, size);
         return;
     }
-    l2cap_packet_handler_cold(packet_type, channel, packet, size);
+    const uint16_t cid = l2cap_event_can_send_now_get_local_cid(packet);
+    if (cid != hid_interrupt_cid && cid != hid_control_cid) {
+        return;
+    }
+    const bool interrupt_lane = cid == hid_interrupt_cid;
+    if (interrupt_lane) {
+        // BTstack consumed this channel's request whether or not the
+        // notification is admitted, so a deferred wakeup must re-request.
+        interrupt_can_send_event_requested = false;
+    }
+    const auto lane = interrupt_lane
+        ? ds5::bt::BtOutputSendChannel::Interrupt
+        : ds5::bt::BtOutputSendChannel::Control;
+    if (!output_send_dispatcher.enter_callback(lane)) {
+        return;
+    }
+    if (interrupt_lane) {
+        handle_l2cap_can_send_now(packet);
+    } else {
+        l2cap_packet_handler_cold(packet_type, channel, packet, size);
+    }
+    // Re-arming here would keep this callback and the SDK notifier's frames
+    // on the stack. The outer pump or the next main-loop service owns it.
+    output_send_dispatcher.leave_callback();
 }
 
 static __attribute__((noinline)) void l2cap_packet_handler_cold(
@@ -4106,8 +4295,7 @@ static __attribute__((noinline)) void l2cap_packet_handler_cold(
             }
             if (size >= 2 && packet[0] == 0xA3) {
                 uint8_t report_id = packet[1];
-                if (feature_data.size() < 32 || feature_data.contains(report_id)) {
-                    feature_data[report_id].assign(packet + 1, packet + size);
+                if (store_feature_report(report_id, packet + 1, static_cast<uint16_t>(size - 1))) {
                     DS5_LOG("[L2CAP] Stored Feature Report 0x%02X, len=%u\n", report_id, size - 1);
                 }
             }
@@ -4317,8 +4505,18 @@ static __attribute__((noinline)) void l2cap_packet_handler_cold(
     }
 }
 
-static bool build_interrupt_output_packet(uint8_t *data, uint16_t len, vector<uint8_t> &packet) {
-    packet.assign(len + 1, 0);
+template <std::size_t Capacity>
+static inline __attribute__((always_inline)) bool build_interrupt_output_packet(
+    uint8_t *data,
+    uint16_t len,
+    ds5::InlineBytes<Capacity> &packet
+) {
+    if (data == nullptr || !packet.assign_fill(len + 1u, 0)) {
+        DS5_LOG("[L2CAP bt_write] Refusing output report of length %u\n",
+            static_cast<unsigned>(len));
+        packet.clear();
+        return false;
+    }
     packet[0] = 0xA2;
     memcpy(packet.data() + 1, data, len);
     if (!fill_output_report_checksum(packet.data() + 1, len)) {
@@ -4330,7 +4528,8 @@ static bool build_interrupt_output_packet(uint8_t *data, uint16_t len, vector<ui
     return true;
 }
 
-static bool dualsense_output_transport_report(output_packet const &packet) {
+template <typename Packet>
+static bool dualsense_output_transport_report(Packet const &packet) {
     if (packet.data.size() <= 2) {
         return false;
     }
@@ -4341,7 +4540,7 @@ static bool dualsense_output_transport_report(output_packet const &packet) {
         || report_id == 0x39;
 }
 
-static bool prepare_interrupt_output_packet_for_send(output_packet &packet) {
+static bool prepare_interrupt_output_packet_for_send(output_send_packet &packet) {
     if (!dualsense_output_transport_report(packet)) {
         return true;
     }
@@ -4351,40 +4550,65 @@ static bool prepare_interrupt_output_packet_for_send(output_packet &packet) {
     return fill_output_report_checksum(report, report_len);
 }
 
-static void commit_interrupt_output_packet_sent(output_packet const &packet) {
+static void commit_interrupt_output_packet_sent(output_send_packet const &packet) {
     if (!dualsense_output_transport_report(packet)) {
         return;
     }
     state_report_seq = static_cast<uint8_t>((state_report_seq + 1) & 0x0f);
 }
 
+// BTstack and the send dispatcher are owned by core 0's task context. Other
+// producers only queue packets; bt_output_retry_loop rediscovers that work.
+static bool output_send_context() {
+    return get_core_num() == 0 && __get_current_exception() == 0;
+}
+
 static void request_can_send_if_needed(bool should_request_send) {
-    if (!should_request_send) {
+    if (!should_request_send || !output_send_context()) {
         return;
     }
-    if (connection_phase == BtConnectionPhase::Disconnecting) {
-        return;
-    }
-    if (hid_interrupt_cid == 0) {
-        DS5_LOG("[L2CAP output] Warning: hid_interrupt_cid 0\n");
-        return;
-    }
-    if (interrupt_can_send_event_requested) {
-        return;
-    }
-    interrupt_can_send_event_requested = true;
-    l2cap_request_can_send_now_event(hid_interrupt_cid);
+    output_send_dispatcher.request(ds5::bt::BtOutputSendChannel::Interrupt);
+    pump_output_sends();
 }
 
 static void request_control_can_send_if_needed(bool should_request_send) {
-    if (!should_request_send) {
+    if (!should_request_send || !output_send_context()) {
         return;
     }
-    if (hid_control_cid == 0) {
-        DS5_LOG("[L2CAP control] Warning: hid_control_cid 0\n");
+    output_send_dispatcher.request(ds5::bt::BtOutputSendChannel::Control);
+    pump_output_sends();
+}
+
+void bt_output_service_after_usb() {
+    // Wi-Fi owns the shared CYW43 bus while Wake-on-LAN runs.
+    if (wake_on_lan_quiet_gate() || !output_send_context()) {
         return;
     }
-    l2cap_request_can_send_now_event(hid_control_cid);
+    output_send_dispatcher.resume_after_usb_service();
+    pump_output_sends();
+}
+
+static __attribute__((noinline, noclone, optimize("O2"))) void __not_in_flash_func(pump_output_sends)() {
+    if (!output_send_context()) {
+        return;
+    }
+    output_send_dispatcher.pump([](ds5::bt::BtOutputSendChannel lane) {
+        if (connection_phase == BtConnectionPhase::Disconnecting) {
+            return;
+        }
+        if (lane == ds5::bt::BtOutputSendChannel::Interrupt) {
+            if (hid_interrupt_cid == 0 || interrupt_can_send_event_requested) {
+                return;
+            }
+            interrupt_can_send_event_requested = true;
+            l2cap_request_can_send_now_event(hid_interrupt_cid);
+        } else {
+            if (hid_control_cid == 0) {
+                return;
+            }
+            l2cap_request_can_send_now_event(hid_control_cid);
+        }
+    });
 }
 
 static bool audio_send_window_closed_locked(uint32_t now) {
@@ -4489,7 +4713,10 @@ static bool make_control_packet(uint8_t const *data, uint16_t len, bool coalesci
         return false;
     }
 
-    packet.data.assign(data, data + len);
+    if (!packet.data.assign(data, len)) {
+        DS5_LOG("[L2CAP] Refusing control packet of length %u\n", static_cast<unsigned>(len));
+        return false;
+    }
     packet.enqueue_time_us = time_us_32();
     packet.report_id = len > 1 ? data[1] : 0;
     packet.coalescible = coalescible && len > 1;
@@ -5232,6 +5459,9 @@ void bt_write(uint8_t *data, uint16_t len) {
 }
 
 bool bt_write_classified_output(uint8_t *data, uint16_t len) {
+    if (wake_on_lan_quiet_gate()) {
+        return false;
+    }
     output_counters.normal_0x31_rx_count++;
     uint8_t *payload = nullptr;
     uint16_t payload_len = 0;
@@ -5405,27 +5635,78 @@ void bt_get_output_debug_stats(bt_output_debug_stats *stats) {
     critical_section_exit(&queue_lock);
 }
 
-vector<uint8_t> get_feature_data(uint8_t reportId, uint16_t len) {
-    (void)len;
-    // These reports must request fresh controller state; other reports can reuse cached data.
-    auto ret = vector<uint8_t>{};
-    const bool cached = feature_data.contains(reportId);
-    if (cached) {
-        ret = feature_data[reportId];
+static feature_cache_entry *find_feature_cache_entry(uint8_t report_id) {
+    for (feature_cache_entry &entry : feature_cache) {
+        if (entry.valid && entry.report_id == report_id) {
+            return &entry;
+        }
     }
-    const bool requires_fresh_state = reportId == 0x81
-        || reportId == 0x63
-        || reportId == 0x65
-        || reportId == 0x64;
+    return nullptr;
+}
+
+static void clear_feature_cache() {
+    for (feature_cache_entry &entry : feature_cache) {
+        entry.valid = false;
+        entry.data.clear();
+    }
+}
+
+// Keeps the newest report per ID. A new ID is admitted only while a slot is
+// free, matching the previous 32-ID cap; oversized replies are not cached.
+static bool store_feature_report(uint8_t report_id, uint8_t const *data, uint16_t len) {
+    feature_cache_entry *entry = find_feature_cache_entry(report_id);
+    if (entry == nullptr) {
+        for (feature_cache_entry &candidate : feature_cache) {
+            if (!candidate.valid) {
+                entry = &candidate;
+                break;
+            }
+        }
+    }
+    if (entry == nullptr) {
+        return false;
+    }
+    if (!entry->data.assign(data, len)) {
+        entry->valid = false;
+        return false;
+    }
+    entry->valid = true;
+    entry->report_id = report_id;
+    return true;
+}
+
+static void request_feature_report_if_needed(uint8_t report_id) {
+    // These reports must request fresh controller state; other reports can reuse cached data.
+    const bool cached = find_feature_cache_entry(report_id) != nullptr;
+    const bool requires_fresh_state = report_id == 0x81
+        || report_id == 0x63
+        || report_id == 0x65
+        || report_id == 0x64;
     const bool should_request = !cached || requires_fresh_state;
     if (!should_request || hid_control_cid == 0) {
-        return ret;
+        return;
     }
 
-    uint8_t get_feature[] = {0x43, reportId};
+    uint8_t get_feature[] = {0x43, report_id};
     enqueue_control_packet(get_feature, sizeof(get_feature), true);
-    DS5_LOG("[L2CAP] Requesting Get Feature Report 0x%02X\n", reportId);
-    return ret;
+    DS5_LOG("[L2CAP] Requesting Get Feature Report 0x%02X\n", report_id);
+}
+
+bool bt_copy_feature_data(uint8_t report_id, uint8_t *buffer, uint16_t capacity, uint16_t *copied) {
+    if (copied != nullptr) {
+        *copied = 0;
+    }
+    feature_cache_entry const *entry = find_feature_cache_entry(report_id);
+    const bool cached = entry != nullptr;
+    if (cached && buffer != nullptr && copied != nullptr && entry->data.size() > 1) {
+        // The cache keeps the report ID byte; GET_REPORT payloads omit it.
+        const uint16_t available = static_cast<uint16_t>(entry->data.size() - 1);
+        const uint16_t copy_len = available < capacity ? available : capacity;
+        memcpy(buffer, entry->data.data() + 1, copy_len);
+        *copied = copy_len;
+    }
+    request_feature_report_if_needed(report_id);
+    return cached;
 }
 
 void set_feature_data(uint8_t reportId, uint8_t const* data,uint16_t len) {
@@ -5434,19 +5715,20 @@ void set_feature_data(uint8_t reportId, uint8_t const* data,uint16_t len) {
             DS5_LOG("[L2CAP] Set Feature Report 0x%02X rejected: len=%u\n", reportId, len);
             return;
         }
-        vector<uint8_t> set_feature(len + 2);
+        uint8_t set_feature[CONTROL_PACKET_MAX_SIZE]{};
+        const uint16_t set_feature_len = static_cast<uint16_t>(len + 2);
         set_feature[0] = 0x53;
         set_feature[1] = reportId;
-        memcpy(set_feature.data() + 2,data,len);
-        if (!fill_feature_report_checksum(set_feature.data() + 1, len + 1)) {
+        memcpy(set_feature + 2, data, len);
+        if (!fill_feature_report_checksum(set_feature + 1, len + 1)) {
             DS5_LOG("[L2CAP] Refusing Set Feature Report 0x%02X with invalid checksum length %u\n",
                 reportId,
                 static_cast<unsigned>(len + 1));
             return;
         }
-        enqueue_control_packet(set_feature.data(), static_cast<uint16_t>(set_feature.size()), true);
+        enqueue_control_packet(set_feature, set_feature_len, true);
         DS5_LOG("[L2CAP] Requesting Set Feature Report 0x%02X\n", reportId);
-        DS5_HEXDUMP(set_feature.data(), set_feature.size());
+        DS5_HEXDUMP(set_feature, set_feature_len);
     }
 }
 

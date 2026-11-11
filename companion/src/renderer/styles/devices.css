@@ -1,0 +1,413 @@
+/*
+ * Devices, aligned with Kitsune Input's page: a section heading, side-by-side
+ * pairing actions, and a two-column list of controller cards with official
+ * controller art. Kitsune's per-card profile, persona and appearance controls
+ * are not part of DS5 Bridge, so the cards end after their details.
+ */
+.devices-page {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  gap: 12px;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.feature-heading.devices-heading {
+  min-height: 70px;
+  margin-bottom: 0;
+  border: 1px solid var(--section-border);
+  border-radius: 12px;
+  padding: 14px 16px;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr) auto;
+  align-items: center;
+  background: var(--surface-section);
+  box-shadow: none;
+}
+
+.devices-heading-copy {
+  min-width: 0;
+  justify-self: start;
+  text-align: left;
+}
+
+.devices-heading .devices-heading-icon {
+  margin: 0;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  box-shadow: none;
+}
+
+.devices-heading .devices-heading-icon > svg {
+  width: 20px;
+  height: 20px;
+}
+
+.devices-heading h2 {
+  font-weight: var(--font-weight-semibold);
+}
+
+.devices-actions {
+  display: grid;
+  gap: 8px;
+}
+
+.devices-action-strip {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: stretch;
+  gap: 10px;
+  min-height: 36px;
+}
+
+.devices-action-strip .primary-action,
+.devices-action-strip .secondary-action {
+  width: 100%;
+  min-height: 36px;
+  padding: 0 12px;
+  border-radius: 6px;
+  box-shadow: none;
+  font-size: var(--font-size-body);
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
+}
+
+.devices-action-strip .devices-danger-action {
+  color: var(--danger);
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
+}
+
+.devices-action-strip .devices-danger-action:hover:not(:disabled) {
+  border-color: var(--danger-border-strong);
+  background: var(--danger-bg-hover);
+}
+
+.devices-action-strip .devices-danger-action:disabled {
+  color: var(--text-disabled);
+  border-color: var(--surface-border);
+  background: var(--surface-disabled);
+}
+
+.devices-action-error {
+  min-height: 32px;
+  border: 1px solid var(--danger-border);
+  border-radius: 6px;
+  padding: 7px 10px;
+  color: var(--danger);
+  background: var(--danger-bg);
+  font-size: var(--font-size-subtitle);
+  line-height: 1.35;
+}
+
+/*
+ * The card list scrolls through the panel's right and bottom padding, so cards
+ * keep the heading's width whether or not the list overflows and scroll off the
+ * window edge instead of stopping above an empty margin. The scrollbar has a
+ * fixed 10px width so its stable gutter fits inside that padding. The app
+ * shell's inherited scrollbar-color would replace it with a native scrollbar.
+ */
+.trusted-device-scroll {
+  min-height: 0;
+  margin: 0 calc(-1 * var(--control-panel-inline-padding)) calc(-1 * var(--control-panel-bottom-padding)) 0;
+  padding-right: calc(var(--control-panel-inline-padding) - 10px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: auto;
+  scrollbar-gutter: stable;
+}
+
+.trusted-device-scroll::-webkit-scrollbar {
+  width: 10px;
+}
+
+.trusted-device-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.trusted-device-scroll::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: var(--scrollbar-thumb);
+  background-clip: padding-box;
+}
+
+/*
+ * The bottom margin after the cards is also the scroll shadow, using Settings'
+ * fade to the page background. It sticks over cards that continue below and
+ * rests on empty space at the end of the list or when the cards fit, so it
+ * follows every layout change in the same frame without scroll state.
+ */
+.trusted-device-scroll-fade {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  display: block;
+  height: var(--control-panel-bottom-padding);
+  pointer-events: none;
+  background: linear-gradient(0deg, var(--app-bg-flat), transparent);
+}
+
+.trusted-device-grid {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-auto-flow: row;
+  grid-auto-rows: minmax(150px, 1fr);
+  gap: 10px;
+  align-content: start;
+}
+
+.trusted-device-card {
+  position: relative;
+  min-width: 0;
+  min-height: 150px;
+  border: 1px solid var(--section-border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(138px, 39%);
+  grid-template-rows: minmax(min-content, 1fr);
+  align-items: stretch;
+  gap: 12px;
+  overflow: hidden;
+  background: var(--surface-section);
+  box-shadow: none;
+}
+
+.trusted-device-menu-button {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  z-index: 1;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--surface-border-strong);
+  border-radius: 6px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  color: var(--text-control);
+  background: var(--surface-section);
+  box-shadow: none;
+  cursor: pointer;
+  opacity: 1;
+}
+
+.trusted-device-menu-button:hover:not(:disabled) {
+  border-color: var(--accent-border-strong);
+  color: var(--text-strong);
+  background: var(--surface-control-opaque);
+}
+
+.trusted-device-card .trusted-device-menu-button:disabled {
+  color: var(--text-disabled);
+  border-color: var(--surface-border);
+  background-color: var(--surface-disabled);
+  background-image: none;
+  cursor: default;
+  opacity: 1;
+}
+
+.devices-page .trusted-device-menu {
+  position: absolute;
+  top: 46px;
+  right: 12px;
+  z-index: 2;
+  width: 142px;
+  border: 1px solid var(--surface-border-strong);
+  border-radius: 12px;
+  padding: 8px;
+  display: grid;
+  gap: 4px;
+  background: var(--surface-popup);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: var(--shadow-menu);
+}
+
+.trusted-device-menu button {
+  min-height: 30px;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  color: var(--text-control);
+  background: transparent;
+  font: inherit;
+  font-size: var(--font-size-body);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.trusted-device-menu button:hover:not(:disabled) {
+  color: var(--text-strong);
+  background: var(--surface-control-hover);
+}
+
+.trusted-device-menu button.danger {
+  color: var(--danger);
+}
+
+.trusted-device-menu button:disabled {
+  color: var(--text-disabled);
+  background-color: var(--surface-disabled-strong);
+  cursor: default;
+  opacity: 1;
+}
+
+.trusted-device-menu button.danger:disabled {
+  color: var(--text-disabled);
+}
+
+.trusted-device-menu button.danger:hover:not(:disabled) {
+  color: var(--danger-selected-text);
+  background: var(--danger-selected);
+}
+
+.trusted-device-card.connected {
+  border-color: var(--success-border-strong);
+}
+
+.trusted-device-card.cached {
+  border-color: var(--surface-border-strong);
+}
+
+.trusted-device-empty {
+  grid-column: 1 / -1;
+  min-height: 150px;
+  display: grid;
+  align-content: center;
+  gap: 6px;
+  padding: 16px;
+  color: var(--text-muted);
+}
+
+.trusted-device-empty h3 {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--font-size-title);
+  line-height: 1.1;
+}
+
+.trusted-device-empty p {
+  margin: 0;
+  max-width: 46ch;
+  color: var(--text-muted);
+  font-size: var(--font-size-subtitle);
+  line-height: 1.35;
+}
+
+.trusted-device-copy {
+  min-width: 0;
+  height: 100%;
+  box-sizing: border-box;
+  padding-block: 0;
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+  gap: 3px;
+  align-content: stretch;
+}
+
+.trusted-device-slot {
+  color: var(--text-secondary);
+  font-size: var(--font-size-subtitle);
+  font-weight: var(--font-weight-medium);
+  letter-spacing: 0;
+}
+
+.trusted-device-copy h3 {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: var(--font-size-body);
+  font-weight: var(--font-weight-semibold);
+  line-height: 1.22;
+  padding-bottom: 2px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trusted-device-copy p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--font-size-subtitle);
+  line-height: 1.1;
+}
+
+.trusted-device-meta-list {
+  align-self: end;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 10em), 1fr));
+  gap: 4px 16px;
+  min-width: 0;
+  margin-top: 4px;
+  font-size: var(--font-size-subtitle);
+}
+
+.trusted-device-meta-row {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+  color: var(--text-muted);
+  line-height: 1.2;
+}
+
+.trusted-device-meta-row span {
+  color: var(--text-secondary);
+  font-size: var(--font-size-subtitle);
+  font-weight: var(--font-weight-medium);
+  letter-spacing: 0;
+}
+
+.trusted-device-meta-row strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-control);
+  font-weight: var(--font-weight-medium);
+  font-size: var(--font-size-subtitle);
+  line-height: 1.24;
+  padding-bottom: 2px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trusted-device-art {
+  min-width: 0;
+  min-height: 105px;
+  padding-top: 36px;
+  display: grid;
+  align-items: end;
+  justify-items: center;
+}
+
+.trusted-device-art img {
+  width: min(207px, 100%);
+  height: auto;
+  aspect-ratio: 3 / 2;
+  object-fit: contain;
+  image-rendering: auto;
+  opacity: 0.9;
+}
+
+@media (max-width: 1020px) {
+  .trusted-device-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 760px) {
+  .devices-action-strip {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trusted-device-card {
+    grid-template-columns: minmax(0, 1fr) minmax(128px, 34%);
+  }
+}

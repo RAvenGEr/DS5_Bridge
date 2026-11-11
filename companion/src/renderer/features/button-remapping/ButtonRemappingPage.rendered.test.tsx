@@ -1,0 +1,166 @@
+// @vitest-environment jsdom
+import { act } from 'react';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { DEFAULT_BUTTON_REMAP_PROFILE } from '@shared/protocol';
+import {
+  buttonByText,
+  chooseOption,
+  click,
+  fixtureSnapshot,
+  installBridgeMock,
+  installDomStubs,
+  openPage,
+  renderApp,
+  unmountApp
+} from '../../test-support/app-harness';
+
+beforeAll(installDomStubs);
+afterEach(unmountApp);
+
+const customProfile = { ...DEFAULT_BUTTON_REMAP_PROFILE, id: 'custom-1', name: 'Racing' };
+
+async function submitDialog(host: HTMLElement) {
+  await act(async () => {
+    host.querySelector<HTMLButtonElement>('[role="dialog"][aria-label="Button remapping profile"] button[type="submit"]')!.click();
+  });
+}
+
+describe('Button Remapping page', () => {
+  it('draws the callout lines on the first visit, when the page chunk mounts after activation', async () => {
+    // jsdom has no layout; give every element a size so the page can measure.
+    const rect = { x: 0, y: 0, left: 0, top: 0, right: 600, bottom: 430, width: 600, height: 430, toJSON: () => ({}) };
+    const restore = [
+      vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(rect as DOMRect),
+      vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(600),
+      vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(430)
+    ];
+    try {
+      installBridgeMock(fixtureSnapshot());
+      const host = await renderApp();
+      const page = await openPage(host, 'remapping');
+
+      // 16 standard buttons plus the four DualSense Edge back and function buttons.
+      const lines = [...page.querySelectorAll('.remapping-callout-line')];
+      expect(lines).toHaveLength(20);
+      expect(lines[0].getAttribute('points')?.split(' ').length).toBeGreaterThan(2);
+    } finally {
+      restore.forEach((spy) => spy.mockRestore());
+    }
+  });
+
+  it('lays out every DualSense Edge slot around the controller art', async () => {
+    installBridgeMock(fixtureSnapshot());
+    const host = await renderApp();
+    const page = await openPage(host, 'remapping');
+
+    expect(page.querySelector('h2')?.textContent).toBe('Button Remapping');
+    expect(page.querySelectorAll('.remapping-side-left .remapping-pill')).toHaveLength(8);
+    expect(page.querySelectorAll('.remapping-side-right .remapping-pill')).toHaveLength(8);
+    expect([...page.querySelectorAll('.remapping-edge-layer [data-remap-button-id]')].map((pill) => pill.getAttribute('data-remap-button-id')))
+      .toEqual(['lb', 'rb', 'lfn', 'rfn']);
+    expect(page.querySelector('.remapping-side-left img')?.getAttribute('alt')).toBe('L2');
+    expect(page.querySelector('.remapping-controller-art')?.getAttribute('src')).toContain('edge');
+  });
+
+  it('hides the Edge back buttons for a standard DualSense', async () => {
+    installBridgeMock(fixtureSnapshot({ status: { controllerType: 'dualsense' } }));
+    const host = await renderApp();
+    const page = await openPage(host, 'remapping');
+    expect(page.querySelector('.remapping-edge-layer')).toBeNull();
+  });
+
+  it('keeps the Edge layout from the last controller while none is connected', async () => {
+    window.localStorage.setItem('ds5bridge.lastRemapControllerType', 'dualsense-edge');
+    installBridgeMock(fixtureSnapshot({ status: { controllerConnected: false, controllerType: 'unknown' } }));
+    const host = await renderApp();
+    const page = await openPage(host, 'remapping');
+    expect(page.querySelector('.remapping-edge-layer')).not.toBeNull();
+  });
+
+  it('remaps a slot and restores the defaults', async () => {
+    const bridge = installBridgeMock(fixtureSnapshot());
+    const host = await renderApp();
+    const page = await openPage(host, 'remapping');
+
+    await chooseOption(page, 'Cross remap target', 'Circle');
+    expect(bridge.fn('setButtonRemap')).toHaveBeenCalledWith('cross', 'circle');
+    expect(page.querySelector('[data-remap-button-id="cross"]')?.classList.contains('changed')).toBe(true);
+
+    await click(buttonByText(page, 'Restore Defaults'));
+    expect(bridge.fn('restoreButtonRemappingDefaults')).toHaveBeenCalledOnce();
+  });
+
+  it('saves a new profile and locks rename and delete for the default', async () => {
+    const bridge = installBridgeMock(fixtureSnapshot());
+    const host = await renderApp();
+    const page = await openPage(host, 'remapping');
+    expect(buttonByText(page, 'Rename Profile')?.disabled).toBe(true);
+    expect(buttonByText(page, 'Delete Profile')?.disabled).toBe(true);
+
+    await click(buttonByText(page, 'Save New Profile'));
+    const input = host.querySelector<HTMLInputElement>('[role="dialog"][aria-label="Button remapping profile"] input')!;
+    expect(input.value).toBe('Custom Profile 1');
+    await submitDialog(host);
+    expect(bridge.fn('saveButtonRemappingProfile')).toHaveBeenCalledWith('Custom Profile 1');
+  });
+
+  it('selects, renames, and deletes a custom profile', async () => {
+    const bridge = installBridgeMock(fixtureSnapshot({
+      settings: {
+        buttonRemappingProfiles: [DEFAULT_BUTTON_REMAP_PROFILE, customProfile],
+        selectedButtonRemappingProfileId: 'custom-1'
+      }
+    }));
+    const host = await renderApp();
+    const page = await openPage(host, 'remapping');
+
+    await chooseOption(page, 'Button remapping profile', 'Default');
+    expect(bridge.fn('selectButtonRemappingProfile')).toHaveBeenCalledWith('default');
+
+    await click(buttonByText(page, 'Rename Profile'));
+    const input = host.querySelector<HTMLInputElement>('[role="dialog"][aria-label="Button remapping profile"] input')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, 'Rally');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await submitDialog(host);
+    expect(bridge.fn('renameButtonRemappingProfile')).toHaveBeenCalledWith('custom-1', 'Rally');
+
+    await click(buttonByText(page, 'Delete Profile'));
+    expect(host.querySelector('[role="dialog"][aria-label="Button remapping profile"]')?.textContent).toContain('Delete Racing?');
+    await submitDialog(host);
+    expect(bridge.fn('deleteButtonRemappingProfile')).toHaveBeenCalledWith('custom-1');
+  });
+
+  it('turns remapping off and back on from the header icon', async () => {
+    window.localStorage.clear();
+    const settings = { buttonRemappingProfiles: [DEFAULT_BUTTON_REMAP_PROFILE, customProfile] };
+    const bridge = installBridgeMock(fixtureSnapshot({ settings: { ...settings, selectedButtonRemappingProfileId: 'custom-1' } }));
+    bridge.fn('selectButtonRemappingProfile').mockImplementation(async (id: string) => fixtureSnapshot({
+      settings: { ...settings, selectedButtonRemappingProfileId: id }
+    }));
+    const host = await renderApp();
+    const page = await openPage(host, 'remapping');
+    const icon = () => page.querySelector<HTMLButtonElement>('.studio-heading-copy .remapping-enable-button')!;
+
+    expect(icon().getAttribute('aria-pressed')).toBe('true');
+    expect(icon().title).toBe('Racing button mapping profile active. Switch to Default.');
+    await click(icon());
+    expect(bridge.fn('selectButtonRemappingProfile')).toHaveBeenLastCalledWith('default');
+    expect(icon().getAttribute('aria-pressed')).toBe('false');
+    expect(icon().title).toBe('Default button mapping profile active. Restore Racing.');
+    await click(icon());
+    expect(bridge.fn('selectButtonRemappingProfile')).toHaveBeenLastCalledWith('custom-1');
+    expect(icon().getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('keeps the header icon off with nothing to restore', async () => {
+    window.localStorage.clear();
+    installBridgeMock(fixtureSnapshot());
+    const host = await renderApp();
+    const page = await openPage(host, 'remapping');
+    const icon = page.querySelector<HTMLButtonElement>('.studio-heading-copy .remapping-enable-button')!;
+    expect(icon.disabled).toBe(true);
+    expect(icon.title).toBe('Default button mapping profile active. No previous custom profile available.');
+  });
+});

@@ -1,0 +1,19 @@
+/* Empty cards shown for the moment before the first bridge snapshot arrives. */
+.startup-placeholder-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  align-content: start;
+  gap: 12px;
+}
+
+.startup-placeholder-grid span {
+  height: 96px;
+  border: 1px solid var(--surface-border);
+  border-radius: var(--card-radius);
+  background: var(--surface-card);
+}
+
+.startup-placeholder-grid span.wide {
+  grid-column: 1 / -1;
+  height: 196px;
+}

@@ -1,0 +1,417 @@
+/*
+ * Every Kitsune Input offer: the one-time launch offer, the monthly ask and
+ * the window-bar banner's dialog. Flat surfaces only: no gradients or glows.
+ * Kitsune's orange marks the call to action in every theme.
+ */
+.kitsune-launch-offer-backdrop {
+  z-index: 140;
+}
+
+.kitsune-launch-offer-modal {
+  --kitsune-orange: #ff6a18;
+  --kitsune-orange-hover: #ff7f3a;
+
+  position: relative;
+  top: auto;
+  right: auto;
+  width: min(760px, calc(100vw - 48px));
+  max-height: calc(100vh - 48px);
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--surface-border-strong);
+  background: var(--surface-menu);
+  box-shadow: var(--shadow-menu);
+  outline: none;
+  animation: modal-panel-in 160ms ease-out;
+}
+
+/*
+ * The headline, tiles and controllers. When a long language or large text
+ * makes the panel too tall, this part scrolls and the price, actions and the
+ * ask's Continue stay in view below it.
+ */
+.kitsune-launch-offer-body {
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.kitsune-launch-offer-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 2;
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--surface-border-strong);
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  background: var(--surface-control);
+  line-height: 1;
+}
+
+.kitsune-launch-offer-close:hover {
+  color: var(--text-strong);
+  background: var(--surface-control-hover);
+}
+
+.kitsune-launch-offer-close:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.kitsune-launch-offer-hero {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 18px;
+  align-items: center;
+  padding-right: 104px;
+}
+
+.kitsune-launch-offer-logo {
+  width: 72px;
+  height: auto;
+}
+
+.kitsune-launch-offer-hero-copy {
+  min-width: 0;
+}
+
+.kitsune-launch-offer-hero .kitsune-promotion-wordmark {
+  font-size: var(--font-size-title);
+}
+
+.kitsune-launch-offer-hero h2 {
+  margin: 4px 0 0;
+  color: var(--text-strong);
+  font-size: calc(var(--font-size-title) * 1.6);
+  font-weight: var(--font-weight-strong);
+  line-height: 1.08;
+  text-wrap: balance;
+}
+
+.kitsune-launch-offer-hero p {
+  margin: 8px 0 0;
+  color: var(--text-secondary);
+  font-size: var(--font-size-body);
+  line-height: 1.45;
+  text-wrap: pretty;
+}
+
+/*
+ * What Kitsune Input adds: four-across tiles, each a plain orange glyph over
+ * its title. No tinted icon square, so the tiles stay clean on any theme.
+ */
+.kitsune-launch-offer-features {
+  margin: 18px 0 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  list-style: none;
+}
+
+.kitsune-launch-offer-features li {
+  min-width: 0;
+  min-height: 92px;
+  padding: 14px 10px 12px;
+  border: 1px solid var(--surface-border);
+  border-radius: var(--card-radius);
+  display: grid;
+  grid-template-rows: 24px auto;
+  justify-items: center;
+  align-content: center;
+  gap: 10px;
+  text-align: center;
+  background: var(--surface-control);
+}
+
+.kitsune-launch-offer-feature-icon {
+  display: grid;
+  place-items: center;
+  color: var(--kitsune-orange);
+}
+
+.kitsune-launch-offer-feature-icon svg {
+  width: 24px;
+  height: 24px;
+}
+
+/* Kitsune Input's Kitsune Bar fox, masked so it takes the glyph color. */
+.kitsune-launch-offer-feature-mark {
+  width: var(--feature-mark-size, 24px);
+  height: var(--feature-mark-size, 24px);
+  display: block;
+  background: currentColor;
+  -webkit-mask: var(--feature-mark) center / contain no-repeat;
+  mask: var(--feature-mark) center / contain no-repeat;
+}
+
+.kitsune-launch-offer-features strong {
+  min-width: 0;
+  color: var(--text-strong);
+  font-size: var(--font-size-body);
+  font-weight: var(--font-weight-semibold);
+  line-height: 1.25;
+  text-wrap: balance;
+}
+
+/* The controllers Kitsune Input adds: each logo beside its name, unframed. */
+.kitsune-launch-offer-compat {
+  margin-top: 18px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+}
+
+/* Reads as the start of a sentence, not a section heading. */
+.kitsune-launch-offer-compat h3 {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--font-size-body);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.2;
+}
+
+.kitsune-launch-offer-controllers {
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 26px;
+  list-style: none;
+}
+
+.kitsune-launch-offer-controllers li {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.kitsune-launch-offer-controller-logo {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--control-radius);
+  display: grid;
+  place-items: center;
+  color: var(--text-strong);
+}
+
+.kitsune-launch-offer-controller-logo.playstation::before {
+  content: "";
+  width: 24px;
+  height: 24px;
+  background: currentColor;
+  -webkit-mask: var(--controller-logo-mask) center / contain no-repeat;
+  mask: var(--controller-logo-mask) center / contain no-repeat;
+}
+
+.kitsune-launch-offer-controllers strong {
+  color: var(--text-strong);
+  font-size: var(--font-size-body);
+  font-weight: var(--font-weight-strong);
+  white-space: nowrap;
+}
+
+.kitsune-launch-offer-controllers li > span:last-child:not(.kitsune-launch-offer-controller-logo) {
+  color: var(--text-muted);
+  font-size: var(--font-size-subtitle);
+  white-space: nowrap;
+}
+
+.kitsune-launch-offer-footer {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--surface-divider);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 14px 20px;
+}
+
+.kitsune-launch-offer-price {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.kitsune-launch-offer-amount {
+  color: var(--text-strong);
+  font-size: calc(var(--font-size-title) * 1.7);
+  font-weight: var(--font-weight-strong);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.kitsune-launch-offer-terms {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.kitsune-launch-offer-terms strong {
+  color: var(--text-primary);
+  font-size: var(--font-size-body);
+}
+
+.kitsune-launch-offer-terms span {
+  color: var(--text-muted);
+  font-size: var(--font-size-subtitle);
+  text-wrap: balance;
+}
+
+.kitsune-launch-offer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.kitsune-launch-offer-actions button {
+  width: auto;
+  min-height: 42px;
+  padding: 0 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: var(--font-size-body);
+  font-weight: var(--font-weight-strong);
+}
+
+.kitsune-launch-offer-get {
+  border: 1px solid var(--kitsune-orange);
+  color: #fff;
+  background: var(--kitsune-orange);
+  box-shadow: none;
+}
+
+.kitsune-launch-offer-get:hover {
+  border-color: var(--kitsune-orange-hover);
+  background: var(--kitsune-orange-hover);
+}
+
+.kitsune-launch-offer-get:focus-visible,
+.kitsune-launch-offer-learn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.kitsune-launch-offer-learn {
+  border-color: var(--surface-border-strong);
+  color: var(--text-primary);
+  background: var(--surface-control);
+  box-shadow: none;
+}
+
+.kitsune-launch-offer-learn:hover {
+  border-color: var(--kitsune-orange);
+  color: var(--text-strong);
+  background: var(--surface-control-hover);
+}
+
+.kitsune-launch-offer-learn svg {
+  color: var(--kitsune-orange);
+}
+
+/*
+ * "Considering Getting Kitsune Input?": the monthly ask. The launch offer's
+ * content on the same panel; Continue is quiet text after the actions.
+ */
+.kitsune-ask-panel {
+  --kitsune-orange: #ff6a18;
+  --kitsune-orange-hover: #ff7f3a;
+
+  position: relative;
+  top: auto;
+  right: auto;
+  width: min(760px, calc(100vw - 48px));
+  max-height: calc(100vh - 48px);
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--surface-border-strong);
+  background: var(--surface-menu);
+  box-shadow: var(--shadow-menu);
+}
+
+.kitsune-ask-modal {
+  animation: modal-panel-in 160ms ease-out;
+}
+
+/* No close button to clear, so the question can use the full width. */
+.kitsune-ask-panel .kitsune-launch-offer-hero {
+  padding-right: 0;
+}
+
+/*
+ * The price gives way before the actions do: its note wraps so Continue,
+ * Learn More and Get Kitsune Input stay on the price's row, and the actions
+ * only drop below it when the note would be squeezed under about 190px.
+ */
+.kitsune-ask-panel .kitsune-launch-offer-price {
+  flex: 1 1 300px;
+}
+
+/* Below the price, the actions stay right, so Continue is always bottom right. */
+.kitsune-ask-panel .kitsune-launch-offer-actions {
+  margin-left: auto;
+}
+
+/* Large text: a little less air, so long languages fit without a scrollbar. */
+.shell:is([data-text-scale="110"], [data-text-scale="120"]) .kitsune-ask-panel .kitsune-launch-offer-features {
+  margin-top: 14px;
+  gap: 8px;
+}
+
+.shell:is([data-text-scale="110"], [data-text-scale="120"]) .kitsune-ask-panel .kitsune-launch-offer-features li {
+  padding: 10px 10px 8px;
+}
+
+.shell:is([data-text-scale="110"], [data-text-scale="120"]) .kitsune-ask-panel .kitsune-launch-offer-compat {
+  margin-top: 12px;
+}
+
+.shell:is([data-text-scale="110"], [data-text-scale="120"]) .kitsune-ask-panel .kitsune-launch-offer-footer {
+  margin-top: 14px;
+  padding-top: 12px;
+}
+
+/* Continue ends the actions as quiet text, so it moves with the buttons. */
+.kitsune-launch-offer-actions .kitsune-ask-continue-button {
+  padding: 0 12px;
+  border: 0;
+  border-radius: var(--control-radius);
+  color: var(--text-secondary);
+  background: transparent;
+  box-shadow: none;
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.kitsune-launch-offer-actions .kitsune-ask-continue-button:hover {
+  color: var(--text-strong);
+  background: var(--surface-control-hover);
+}
+
+.kitsune-launch-offer-actions .kitsune-ask-continue-button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+@media (max-width: 620px) {
+  .kitsune-launch-offer-features {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

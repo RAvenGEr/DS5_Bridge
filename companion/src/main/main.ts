@@ -1,8 +1,11 @@
-import { app, BrowserWindow, Menu, Notification, Tray, dialog, ipcMain, nativeImage, powerMonitor, screen, shell } from 'electron';
+import { app, BrowserWindow, Menu, Notification, Tray, dialog, ipcMain, nativeImage, powerMonitor, safeStorage, screen, shell } from 'electron';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { BootloaderAuthorizationStore } from './bootloader-authorization-store';
+import { wakeOnLanResult } from '../shared/wake-on-lan-result';
+import type { WakeOnLanConfigurationInput } from '../shared/wake-on-lan-types';
 import { BridgeService } from './bridge-service';
 import {
   PICO_UNIVERSAL_FLASH_NUKE_FILE,
@@ -11,7 +14,13 @@ import {
   mountPicoBootloaderDrive,
   nukePicoFlash as copyPicoFlashNuke
 } from './pico-firmware-updater';
-import { SettingsStore } from './settings-store';
+import { DEFAULT_SETTINGS, SettingsStore } from './settings-store';
+import { fitMainWindowToWorkArea, type MainWindowPresentation } from './main-window-sizing';
+import {
+  TRAY_BATTERY_ICON_SCALE_FACTOR,
+  TRAY_BATTERY_ICON_SIZE,
+  createTrayBatteryIconBuffer
+} from './tray-icon-bitmap';
 import type {
   AdaptiveTriggerPreviewEffect,
   AudioReactiveHapticsConfig,
@@ -32,7 +41,9 @@ import type {
   BridgeSnapshot,
   PicoFirmwareAction,
   PicoFirmwareActionResult,
+  UiLocalePreference,
   UiScalePercent,
+  UiTextScalePercent,
   UiThemePreset
 } from '../shared/types';
 
@@ -45,23 +56,31 @@ const APP_TRAY_ICON_PNG = path.join('assets', 'controllers', 'ds5-bridge_mark.pn
 const APP_ICON_ICO = path.join('assets', 'controllers', 'ds5-bridge_app-icon-tile.ico');
 const PICO_UNIVERSAL_FLASH_NUKE_RELATIVE_PATH = path.join('firmware', PICO_UNIVERSAL_FLASH_NUKE_FILE);
 const PICO_UNIVERSAL_FLASH_NUKE_SHA256_RELATIVE_PATH = path.join('firmware', PICO_UNIVERSAL_FLASH_NUKE_SHA256_FILE);
-const BASE_WINDOW_WIDTH = 1120;
-const BASE_WINDOW_HEIGHT = 630;
 const START_IN_TRAY_ARG = '--start-in-tray';
 const ALLOW_PARALLEL_AUTOMATION_INSTANCE = process.env.DS5_BRIDGE_ALLOW_PARALLEL_AUTOMATION_INSTANCE === '1';
+// Automation instances (Playwright, smoke checks) share the installed app's
+// settings, Run value and Start Menu shortcut. Registering from one would
+// delete the real login item or point login and toasts at a development
+// electron.exe, so they leave Windows integration alone.
+const WINDOWS_REGISTRATION_ENABLED = !ALLOW_PARALLEL_AUTOMATION_INSTANCE;
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let trayDefaultIcon: Electron.NativeImage | null = null;
 let bridgeService: BridgeService | null = null;
 let isQuitting = false;
 let shutdownComplete = false;
+// Ported from Kitsune Input: a tray start creates no window, and a window
+// left hidden this long is released (about 25-50 MiB of renderer memory)
+// and recreated on the next open.
+const MAIN_WINDOW_RETIRE_AFTER_HIDDEN_MS = 10 * 60_000;
+const MAIN_WINDOW_RETIRE_RETRY_MS = 60_000;
+let mainWindowRetireTimer: NodeJS.Timeout | null = null;
+let mainWindowShowPending = false;
+// Firmware actions own a renderer-visible result; never retire under them.
+let mainWindowBusyTasks = 0;
+let appSettingsStore: SettingsStore | null = null;
 const hasSingleInstanceLock = ALLOW_PARALLEL_AUTOMATION_INSTANCE || app.requestSingleInstanceLock();
 const audioHapticsIconCache = new Map<string, Promise<string | null> | string | null>();
-const TRAY_BATTERY_ICON_SIZE = 32;
-const TRAY_BATTERY_ICON_SCALE_FACTOR = 2;
-const TRAY_BATTERY_ICON_SHADOW = { red: 0, green: 0, blue: 0, alpha: 180 };
-const TRAY_BATTERY_ICON_DISCHARGING = { red: 245, green: 248, blue: 255, alpha: 255 };
-const TRAY_BATTERY_ICON_EXTERNAL_POWER = { red: 57, green: 215, blue: 125, alpha: 255 };
 const trayBatteryIconCache = new Map<string, Electron.NativeImage>();
 
 function windowsAppUserModelId(): string {
@@ -111,19 +130,18 @@ async function createTrayIcon(): Promise<Electron.NativeImage> {
   return pngIcon.isEmpty() ? nativeImage.createEmpty() : pngIcon;
 }
 
-function scaledWindowSize(uiScalePercent: UiScalePercent): { width: number; height: number } {
-  const scale = uiScalePercent / 100;
-  return {
-    width: Math.round(BASE_WINDOW_WIDTH * scale),
-    height: Math.round(BASE_WINDOW_HEIGHT * scale)
-  };
+function scaledWindowPresentation(
+  uiScalePercent: UiScalePercent,
+  workArea: Electron.Rectangle | null
+): MainWindowPresentation {
+  return fitMainWindowToWorkArea(uiScalePercent, workArea);
 }
 
 function applyWindowScale(window: BrowserWindow, uiScalePercent: UiScalePercent, recenter: boolean): void {
-  const { width, height } = scaledWindowSize(uiScalePercent);
   const currentBounds = window.getBounds();
   const display = screen.getDisplayMatching(currentBounds);
   const workArea = display.workArea;
+  const { width, height, zoomFactor } = scaledWindowPresentation(uiScalePercent, workArea);
   const centerX = currentBounds.x + (currentBounds.width / 2);
   const centerY = currentBounds.y + (currentBounds.height / 2);
   const x = recenter
@@ -133,7 +151,7 @@ function applyWindowScale(window: BrowserWindow, uiScalePercent: UiScalePercent,
     ? Math.round(Math.max(workArea.y, Math.min(centerY - (height / 2), workArea.y + workArea.height - height)))
     : currentBounds.y;
 
-  window.webContents.setZoomFactor(uiScalePercent / 100);
+  window.webContents.setZoomFactor(zoomFactor);
   window.setMinimumSize(width, height);
   window.setMaximumSize(width, height);
   window.setBounds({ x, y, width, height }, false);
@@ -149,7 +167,7 @@ function applySnapshotWindowScale(snapshot: { settings: { uiScalePercent: UiScal
 }
 
 function currentUiScalePercent(): UiScalePercent {
-  return bridgeService?.getSnapshot().settings.uiScalePercent ?? 100;
+  return bridgeService?.getSnapshot().settings.uiScalePercent ?? DEFAULT_SETTINGS.uiScalePercent;
 }
 
 function trayControllerName(type: NonNullable<BridgeSnapshot['status']>['controllerType'] | undefined): string {
@@ -199,130 +217,19 @@ function trayTooltipWithBatteryPercent(
   return `${name} \u2014 ${batteryPercent}%`;
 }
 
-type TrayBatteryIconColor = {
-  red: number;
-  green: number;
-  blue: number;
-  alpha: number;
-};
-
-const TRAY_BATTERY_DIGIT_SEGMENTS: Record<string, string> = {
-  '0': 'abcdef',
-  '1': 'bc',
-  '2': 'abdeg',
-  '3': 'abcdg',
-  '4': 'bcfg',
-  '5': 'acdfg',
-  '6': 'acdefg',
-  '7': 'abc',
-  '8': 'abcdefg',
-  '9': 'abcdfg'
-};
-
-function setTrayIconPixel(buffer: Buffer, x: number, y: number, color: TrayBatteryIconColor): void {
-  if (x < 0 || y < 0 || x >= TRAY_BATTERY_ICON_SIZE || y >= TRAY_BATTERY_ICON_SIZE) {
-    return;
-  }
-  const offset = ((y * TRAY_BATTERY_ICON_SIZE) + x) * 4;
-  buffer[offset] = color.blue;
-  buffer[offset + 1] = color.green;
-  buffer[offset + 2] = color.red;
-  buffer[offset + 3] = color.alpha;
-}
-
-function drawTrayIconRect(
-  buffer: Buffer,
-  x: number,
-  y: number,
-  width: number,
-  height: number,
-  color: TrayBatteryIconColor
-): void {
-  for (let row = y; row < y + height; row += 1) {
-    for (let column = x; column < x + width; column += 1) {
-      setTrayIconPixel(buffer, column, row, color);
-    }
-  }
-}
-
-function drawTrayIconDigit(
-  buffer: Buffer,
-  digit: string,
-  x: number,
-  y: number,
-  width: number,
-  height: number,
-  thickness: number,
-  color: TrayBatteryIconColor
-): void {
-  const segments = TRAY_BATTERY_DIGIT_SEGMENTS[digit];
-  if (!segments) {
-    return;
-  }
-
-  const middleY = Math.floor((height - thickness) / 2);
-  const lowerHeight = height - middleY - (thickness * 2);
-  const rects: Record<string, [number, number, number, number]> = {
-    a: [x + thickness, y, width - (thickness * 2), thickness],
-    b: [x + width - thickness, y + thickness, thickness, middleY - thickness],
-    c: [x + width - thickness, y + middleY + thickness, thickness, lowerHeight],
-    d: [x + thickness, y + height - thickness, width - (thickness * 2), thickness],
-    e: [x, y + middleY + thickness, thickness, lowerHeight],
-    f: [x, y + thickness, thickness, middleY - thickness],
-    g: [x + thickness, y + middleY, width - (thickness * 2), thickness]
-  };
-
-  for (const segment of segments) {
-    const [segmentX, segmentY, segmentWidth, segmentHeight] = rects[segment];
-    drawTrayIconRect(buffer, segmentX, segmentY, segmentWidth, segmentHeight, color);
-  }
-}
-
-function drawTrayIconNumber(buffer: Buffer, text: string, color: TrayBatteryIconColor, offset = 0): void {
-  const digitCount = text.length;
-  const digitWidth = digitCount === 1 ? 14 : digitCount === 2 ? 12 : 9;
-  const digitHeight = digitCount === 1 ? 24 : digitCount === 2 ? 24 : 22;
-  const thickness = digitCount === 3 ? 2 : 3;
-  const spacing = digitCount === 1 ? 0 : digitCount === 2 ? 2 : 1;
-  const totalWidth = (digitCount * digitWidth) + ((digitCount - 1) * spacing);
-  const startX = Math.floor((TRAY_BATTERY_ICON_SIZE - totalWidth) / 2) + offset;
-  const startY = Math.floor((TRAY_BATTERY_ICON_SIZE - digitHeight) / 2) + offset;
-
-  for (let index = 0; index < text.length; index += 1) {
-    drawTrayIconDigit(
-      buffer,
-      text[index],
-      startX + (index * (digitWidth + spacing)),
-      startY,
-      digitWidth,
-      digitHeight,
-      thickness,
-      color
-    );
-  }
-}
-
 function batteryTrayIcon(
   percent: number,
   powerState: TrayBatteryPowerState
 ): Electron.NativeImage {
   const clampedPercent = Math.max(0, Math.min(100, Math.round(percent)));
-  const text = String(clampedPercent);
-  const key = `${text}:${powerState}`;
+  const powered = powerState !== 'battery';
+  const key = `${clampedPercent}:${powered}`;
   const cached = trayBatteryIconCache.get(key);
   if (cached) {
     return cached;
   }
 
-  const buffer = Buffer.alloc(TRAY_BATTERY_ICON_SIZE * TRAY_BATTERY_ICON_SIZE * 4);
-  drawTrayIconNumber(buffer, text, TRAY_BATTERY_ICON_SHADOW, 1);
-  drawTrayIconNumber(
-    buffer,
-    text,
-    powerState === 'battery'
-      ? TRAY_BATTERY_ICON_DISCHARGING
-      : TRAY_BATTERY_ICON_EXTERNAL_POWER
-  );
+  const buffer = createTrayBatteryIconBuffer(clampedPercent, powered);
   const image = nativeImage.createFromBitmap(buffer, {
     width: TRAY_BATTERY_ICON_SIZE,
     height: TRAY_BATTERY_ICON_SIZE,
@@ -387,7 +294,7 @@ function loginItemArgs(): string[] {
 }
 
 function applyLaunchAtStartup(enabled: boolean): void {
-  if (process.platform !== 'win32') {
+  if (process.platform !== 'win32' || !WINDOWS_REGISTRATION_ENABLED) {
     return;
   }
 
@@ -420,11 +327,16 @@ function isAllowedExternalUrl(url: string): boolean {
     || /^https:\/\/ko-fi\.com\/s\/d1f0a3b26f\/?$/i.test(url)
     || /^https:\/\/github\.com\/SundayMoments\/?$/i.test(url)
     || /^https:\/\/discord\.gg\/By5jhh73wr\/?$/i.test(url)
-    || /^https:\/\/kitsuneinput\.com\/?$/i.test(url);
+    || /^https:\/\/kitsuneinput\.com\/?$/i.test(url)
+    || /^https:\/\/kitsuneinput\.com\/\?src=ds5-popup$/i.test(url)
+    || /^https:\/\/kitsuneinput\.com\/buy\?src=ds5-popup$/i.test(url);
 }
 
 function createWindow(uiScalePercent: UiScalePercent): BrowserWindow {
-  const { width, height } = scaledWindowSize(uiScalePercent);
+  const { width, height, zoomFactor } = scaledWindowPresentation(
+    uiScalePercent,
+    screen.getPrimaryDisplay().workArea
+  );
   const rendererIndexPath = path.join(__dirname, '..', '..', 'renderer', 'index.html');
   const window = new BrowserWindow({
     width,
@@ -445,16 +357,18 @@ function createWindow(uiScalePercent: UiScalePercent): BrowserWindow {
     icon: createRuntimeIcon(),
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload.js'),
+      zoomFactor,
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true
     }
   });
 
+  // Clipboard writes back the Copy buttons (Last Restart); reads stay denied.
   window.webContents.session.setPermissionRequestHandler((webContents, permission, callback) => {
     callback(
       webContents === window.webContents
-      && (permission === 'media' || permission === 'speaker-selection')
+      && (permission === 'media' || permission === 'speaker-selection' || permission === 'clipboard-sanitized-write')
     );
   });
   window.webContents.setWindowOpenHandler(({ url }) => {
@@ -473,7 +387,7 @@ function createWindow(uiScalePercent: UiScalePercent): BrowserWindow {
   window.on('close', (event) => {
     if (!isQuitting) {
       event.preventDefault();
-      window.hide();
+      closeMainWindow(window);
     }
   });
   window.on('will-move', () => bridgeService?.pausePollingFor(1200));
@@ -486,13 +400,99 @@ function createWindow(uiScalePercent: UiScalePercent): BrowserWindow {
   return window;
 }
 
+// The close button hides to the tray unless the user chose to quit there.
+// While a Pico firmware action or bootloader confirmation is running it only
+// hides, as retireHiddenMainWindow waits for them: quitting would cut a UF2
+// copy short and leave the bridge half flashed.
+function closeMainWindow(window: BrowserWindow | null): void {
+  const snapshot = bridgeService?.getSnapshot();
+  if (snapshot?.settings.closeButtonQuits && mainWindowBusyTasks === 0 && !snapshot.bootloaderConfirmation) {
+    app.quit();
+    return;
+  }
+  window?.hide();
+}
+
 function sendWindowMaximizedState(): void {
   if (!mainWindow || mainWindow.webContents.isDestroyed()) return;
   mainWindow.webContents.send('window:maximizedChanged', mainWindow.isMaximized());
 }
 
+function clearMainWindowRetireTimer(): void {
+  if (mainWindowRetireTimer) {
+    clearTimeout(mainWindowRetireTimer);
+    mainWindowRetireTimer = null;
+  }
+}
+
+function scheduleMainWindowRetirement(delayMs = MAIN_WINDOW_RETIRE_AFTER_HIDDEN_MS): void {
+  clearMainWindowRetireTimer();
+  mainWindowRetireTimer = setTimeout(retireHiddenMainWindow, delayMs);
+  mainWindowRetireTimer.unref();
+}
+
+function retireHiddenMainWindow(): void {
+  mainWindowRetireTimer = null;
+  const window = mainWindow;
+  if (!window || window.isDestroyed() || window.isVisible() || isQuitting) {
+    return;
+  }
+  if (mainWindowBusyTasks > 0 || bridgeService?.getSnapshot().bootloaderConfirmation) {
+    scheduleMainWindowRetirement(MAIN_WINDOW_RETIRE_RETRY_MS);
+    return;
+  }
+  mainWindow = null;
+  // destroy() skips the close handler, which would only hide it again.
+  window.destroy();
+}
+
+function ensureMainWindow(): BrowserWindow {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    return mainWindow;
+  }
+  const window = createWindow(appSettingsStore?.get().uiScalePercent ?? currentUiScalePercent());
+  mainWindow = window;
+  window.on('maximize', sendWindowMaximizedState);
+  window.on('unmaximize', sendWindowMaximizedState);
+  // Snapshots are not pushed to a hidden window; catch it up when it returns.
+  const sendLatestSnapshot = () => {
+    if (bridgeService) {
+      sendToMainWindow('bridge:snapshot', bridgeService.getSnapshot());
+    }
+  };
+  window.on('show', () => {
+    clearMainWindowRetireTimer();
+    scheduleMainWindowScaleRestore(false);
+    sendLatestSnapshot();
+  });
+  window.on('hide', () => scheduleMainWindowRetirement());
+  window.on('restore', () => {
+    scheduleMainWindowScaleRestore(false);
+    sendLatestSnapshot();
+  });
+  window.on('focus', () => scheduleMainWindowScaleRestore(false));
+  window.on('closed', () => {
+    if (mainWindow === window) {
+      mainWindow = null;
+    }
+  });
+  window.once('ready-to-show', () => {
+    if (mainWindowShowPending) {
+      mainWindowShowPending = false;
+      showWindowCentered();
+    }
+  });
+  return window;
+}
+
 function showWindowCentered(): void {
-  if (!mainWindow) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    // Created hidden; shown once its first paint is ready.
+    mainWindowShowPending = true;
+    ensureMainWindow();
+    return;
+  }
+  if (mainWindowShowPending) {
     return;
   }
 
@@ -714,7 +714,7 @@ New-ItemProperty -Path $registryPath -Name 'IconUri' -Value ${powerShellString(i
 }
 
 function ensureWindowsNotificationShortcut(): void {
-  if (process.platform !== 'win32') {
+  if (process.platform !== 'win32' || !WINDOWS_REGISTRATION_ENABLED) {
     return;
   }
 
@@ -1032,6 +1032,7 @@ async function runPicoFirmwareIpcAction(
   action: PicoFirmwareAction,
   task: () => Promise<PicoFirmwareActionResult>
 ): Promise<PicoFirmwareActionResult> {
+  mainWindowBusyTasks += 1;
   try {
     return await task();
   } catch (error) {
@@ -1040,6 +1041,8 @@ async function runPicoFirmwareIpcAction(
       action,
       message: picoFirmwareErrorMessage(error)
     };
+  } finally {
+    mainWindowBusyTasks -= 1;
   }
 }
 
@@ -1152,6 +1155,12 @@ function registerIpc(service: BridgeService): void {
     applySnapshotWindowScale(snapshot);
     return snapshot;
   });
+  ipcMain.handle('bridge:setUiTextScalePercent', (_event, value: UiTextScalePercent) => (
+    service.setUiTextScalePercent(value)
+  ));
+  ipcMain.handle('bridge:setUiLocale', (_event, value: UiLocalePreference) => (
+    service.setUiLocale(value)
+  ));
   ipcMain.handle('bridge:setUiThemePreset', (_event, value: UiThemePreset) => (
     service.setUiThemePreset(value)
   ));
@@ -1163,9 +1172,10 @@ function registerIpc(service: BridgeService): void {
   ipcMain.handle('bridge:setShowBatteryPercentTrayIcon', (_event, value: boolean) => (
     service.setShowBatteryPercentTrayIcon(Boolean(value))
   ));
-  ipcMain.handle('bridge:setKitsuneInputPromotionDismissed', (_event, value: boolean) => (
-    service.setKitsuneInputPromotionDismissed(Boolean(value))
+  ipcMain.handle('bridge:setCloseButtonQuits', (_event, value: boolean) => (
+    service.setCloseButtonQuits(Boolean(value))
   ));
+  ipcMain.handle('bridge:markKitsuneInputLaunchOfferShown', () => service.markKitsuneInputLaunchOfferShown());
   ipcMain.handle('bridge:setPollingRateMode', (_event, value: PollingRateMode) => (
     service.setPollingRateMode(value)
   ));
@@ -1182,6 +1192,22 @@ function registerIpc(service: BridgeService): void {
     'mount',
     () => mountPicoBootloaderDrive(picoFirmwareOptions(service))
   ));
+  ipcMain.handle('bridge:cancelBootloaderConfirmation', () => service.cancelBootloaderConfirmation());
+  ipcMain.handle('bridge:getWakeOnLan', () => wakeOnLanResult(() => service.getWakeOnLan()));
+  ipcMain.handle('bridge:getWakeOnLanTargets', (_event, refresh: unknown) => wakeOnLanResult(
+    () => service.getWakeOnLanTargets(refresh === true)
+  ));
+  ipcMain.handle('bridge:getWakeOnLanReadiness', (_event, targetMac: unknown, refresh: unknown) => wakeOnLanResult(
+    () => service.getWakeOnLanReadiness(targetMac, refresh === true)
+  ));
+  ipcMain.handle('bridge:configureWakeOnLan', (_event, input: unknown) => wakeOnLanResult(
+    () => service.configureWakeOnLan(input as WakeOnLanConfigurationInput)
+  ));
+  ipcMain.handle('bridge:setWakeOnLanEnabled', (_event, enabled: unknown) => wakeOnLanResult(
+    () => service.setWakeOnLanEnabled(enabled as boolean)
+  ));
+  ipcMain.handle('bridge:forgetWakeOnLan', () => wakeOnLanResult(() => service.forgetWakeOnLan()));
+  ipcMain.handle('bridge:cancelWakeOnLan', () => wakeOnLanResult(() => service.cancelWakeOnLan()));
   ipcMain.handle('bridge:flashPicoFirmware', () => runPicoFirmwareIpcAction(
     'flash',
     () => flashSelectedPicoFirmware(service)
@@ -1195,6 +1221,12 @@ function registerIpc(service: BridgeService): void {
   ));
   ipcMain.handle('bridge:setNotifyLowBattery', (_event, value: boolean) => (
     service.setNotifyLowBattery(value)
+  ));
+  ipcMain.handle('bridge:setNotifyPersonaChange', (_event, value: boolean) => (
+    service.setNotifyPersonaChange(Boolean(value))
+  ));
+  ipcMain.handle('bridge:setNotifyMicMute', (_event, value: boolean) => (
+    service.setNotifyMicMute(Boolean(value))
   ));
   ipcMain.handle('bridge:testNotification', () => service.testNotification());
   ipcMain.handle('bridge:testHaptics', () => service.testHaptics());
@@ -1257,6 +1289,7 @@ function registerIpc(service: BridgeService): void {
   });
   ipcMain.handle('bridge:clearFirmwareLogDirectory', () => service.setFirmwareLogDirectory(null));
   ipcMain.handle('bridge:getDiagnostics', () => service.getSnapshot().diagnostics);
+  ipcMain.handle('app:getVersion', () => app.getVersion());
   ipcMain.handle('window:minimize', () => mainWindow?.minimize());
   ipcMain.handle('window:toggleMaximize', () => {
     if (!mainWindow || !mainWindow.isMaximizable()) return;
@@ -1267,7 +1300,7 @@ function registerIpc(service: BridgeService): void {
     }
   });
   ipcMain.handle('window:isMaximized', () => Boolean(mainWindow?.isMaximized()));
-  ipcMain.handle('window:hide', () => mainWindow?.hide());
+  ipcMain.handle('window:hide', () => closeMainWindow(mainWindow));
   ipcMain.handle('window:openExternal', (_event, url: string) => {
     if (!isAllowedExternalUrl(url)) {
       return;
@@ -1285,21 +1318,18 @@ app.whenReady().then(async () => {
   ensureWindowsNotificationShortcut();
   Menu.setApplicationMenu(null);
   const settingsStore = new SettingsStore(app.getPath('userData'));
+  appSettingsStore = settingsStore;
   applyLaunchAtStartup(settingsStore.get().launchAtStartupEnabled);
-  bridgeService = new BridgeService(settingsStore);
+  bridgeService = new BridgeService(
+    settingsStore,
+    new BootloaderAuthorizationStore(app.getPath('userData'), safeStorage)
+  );
   registerIpc(bridgeService);
 
-  mainWindow = createWindow(settingsStore.get().uiScalePercent);
-  mainWindow.on('maximize', sendWindowMaximizedState);
-  mainWindow.on('unmaximize', sendWindowMaximizedState);
-  mainWindow.on('show', () => scheduleMainWindowScaleRestore(false));
-  mainWindow.on('restore', () => scheduleMainWindowScaleRestore(false));
-  mainWindow.on('focus', () => scheduleMainWindowScaleRestore(false));
-  mainWindow.once('ready-to-show', () => {
-    if (!shouldStartInTray()) {
-      showWindowCentered();
-    }
-  });
+  // A login (tray) start creates no renderer until the tray opens it.
+  if (!shouldStartInTray()) {
+    showWindowCentered();
+  }
   powerMonitor.on('resume', () => scheduleMainWindowScaleRestore(true));
   powerMonitor.on('unlock-screen', () => scheduleMainWindowScaleRestore(true));
   screen.on('display-metrics-changed', () => scheduleMainWindowScaleRestore(true));
@@ -1316,7 +1346,10 @@ app.whenReady().then(async () => {
 
   bridgeService.on('snapshot', (snapshot) => {
     updateTrayPresentation(snapshot);
-    sendToMainWindow('bridge:snapshot', snapshot);
+    // A hidden renderer would only re-render for nothing; 'show' catches it up.
+    if (mainWindow?.isVisible()) {
+      sendToMainWindow('bridge:snapshot', snapshot);
+    }
   });
   bridgeService.on('toast', (toast) => {
     showBridgeNotification(toast);

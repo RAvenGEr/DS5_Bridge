@@ -1,35 +1,28 @@
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { _electron as electron } from 'playwright';
+// Measures alignment across the companion pages and fails on layout drift.
+//
+//   npm run layout:check              drives the real companion (bridges and saved settings)
+//   npm run layout:check -- --fixture uses fixture data in a minimal host instead
+import { fixtureRequested, launchCompanion, openControlTab } from './ui-review/launch.mjs';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const root = path.resolve(__dirname, '..');
-const tabs = ['Haptics', 'Audio', 'Triggers', 'Lighting', 'System'];
-const testButtonTabs = ['Haptics', 'Audio', 'Triggers'];
+const tabs = ['Haptics', 'Audio', 'Adaptive Triggers', 'Lighting', 'System'];
+const testButtonTabs = ['Haptics', 'Audio', 'Adaptive Triggers'];
 const tolerancePx = 1;
 const buttonTolerancePx = 2;
 const startupTutorialStorageKey = 'ds5bridge.startupTutorialCompleted.v1';
 
-const app = await electron.launch({
-  args: ['.'],
-  cwd: root,
-  env: {
-    ...process.env,
-    DS5_BRIDGE_ALLOW_PARALLEL_AUTOMATION_INSTANCE: '1'
-  }
-});
+const { app, close } = await launchCompanion({ fixture: fixtureRequested(), showStartupTutorial: true });
 
 try {
   const page = await app.firstWindow();
   await page.waitForLoadState('domcontentloaded');
-  await page.waitForSelector('.hero-card', { timeout: 10000 });
+  await page.waitForSelector('.shell:not(.starting) .hero-card', { timeout: 10000 });
   await page.waitForTimeout(250);
   await page.evaluate((storageKey) => {
     window.localStorage.removeItem(storageKey);
   }, startupTutorialStorageKey);
   await page.reload();
   await page.waitForLoadState('domcontentloaded');
-  await page.waitForSelector('.hero-card', { timeout: 10000 });
+  await page.waitForSelector('.shell:not(.starting) .hero-card', { timeout: 10000 });
   await page.waitForTimeout(250);
 
   const failures = [];
@@ -43,69 +36,54 @@ try {
       failures.push(`${label}: modal overflowed by ${overflow.horizontal}px horizontal and ${overflow.vertical}px vertical`);
     }
   };
-  const assertNaturalImageRatio = async (locator, label) => {
-    const ratio = await locator.evaluate((element) => {
-      const image = element;
-      const rect = image.getBoundingClientRect();
-      return {
-        natural: image.naturalWidth / image.naturalHeight,
-        rendered: rect.width / rect.height
-      };
-    });
-
-    if (Math.abs(ratio.natural - ratio.rendered) > 0.02) {
-      failures.push(`${label}: rendered ratio ${ratio.rendered.toFixed(2)} differs from natural ratio ${ratio.natural.toFixed(2)}`);
-    }
-  };
-
   const startupTutorial = page.getByRole('dialog', { name: 'Feature tile tutorial' });
   if (await startupTutorial.count()) {
     await assertNoModalOverflow(startupTutorial, 'Feature tile tutorial');
     await page.getByLabel('Toggle example effect').click();
     await page.getByRole('button', { name: /Next/ }).click();
-    const supportTutorial = page.getByRole('dialog', { name: 'Support DS5 Bridge' });
-    await assertNoModalOverflow(supportTutorial, 'Support tutorial');
-    await assertNaturalImageRatio(supportTutorial.locator('.startup-tutorial-kofi-button img'), 'Support tutorial Ko-fi badge');
-    await page.getByRole('button', { name: 'Continue' }).click({ timeout: 7000 });
     await page.waitForTimeout(150);
   }
 
-  const controlsNav = page.getByRole('tablist', { name: 'Controls' });
+  // As in Kitsune Input, the navigation fits without scrolling while Controller is
+  // expanded, Settings sits alone below it, and the Ko-fi badge lives in the window bar.
   const sidebarSupportSpacing = await page.evaluate(() => {
     const sidebar = document.querySelector('.hero-card');
-    const systemButton = document.querySelector('#control-tab-system');
-    const badge = document.querySelector('.sidebar-kofi-badge');
-    const footer = document.querySelector('.header-settings');
-    if (!sidebar || !systemButton || !badge || !footer) return null;
+    const list = document.querySelector('.control-tab-list');
+    const settings = document.querySelector('#control-tab-settings');
+    const badge = document.querySelector('.window-bar .shell-kofi-badge');
+    const banner = document.querySelector('.window-bar-center');
+    const bell = document.querySelector('.window-bar .notifications-button, .window-bar .topbar-tool');
+    if (!sidebar || !list || !settings || !badge) return null;
 
-    const systemIcon = systemButton.querySelector('svg');
-    const systemLabelNode = [...systemButton.childNodes].find(
-      (node) => node.nodeType === Node.TEXT_NODE && node.textContent?.trim()
-    );
-    const systemLabelRange = systemLabelNode ? document.createRange() : null;
-    systemLabelRange?.selectNodeContents(systemLabelNode);
-    const systemContentBottom = Math.max(
-      systemIcon?.getBoundingClientRect().bottom ?? 0,
-      systemLabelRange?.getBoundingClientRect().bottom ?? 0
-    );
+    const listRect = list.getBoundingClientRect();
+    const settingsRect = settings.getBoundingClientRect();
     const badgeRect = badge.getBoundingClientRect();
-    const footerRect = footer.getBoundingClientRect();
     return {
-      above: badgeRect.top - systemContentBottom,
-      below: footerRect.top - badgeRect.bottom,
+      listOverflow: Math.max(0, list.scrollHeight - list.clientHeight),
+      settingsGap: settingsRect.top - listRect.bottom,
+      badgeClearance: Math.min(
+        banner ? badgeRect.left - banner.getBoundingClientRect().right : Infinity,
+        bell ? bell.getBoundingClientRect().left - badgeRect.right : Infinity
+      ),
       overflow: Math.max(0, sidebar.scrollHeight - sidebar.clientHeight)
     };
   });
 
   if (!sidebarSupportSpacing) {
-    failures.push('Sidebar: support badge spacing targets were not found');
-  } else if (Math.abs(sidebarSupportSpacing.above - sidebarSupportSpacing.below) > tolerancePx) {
-    failures.push(
-      `Sidebar: Ko-fi badge has ${sidebarSupportSpacing.above.toFixed(2)}px above and ${sidebarSupportSpacing.below.toFixed(2)}px below`
-    );
-  }
-  if (sidebarSupportSpacing && sidebarSupportSpacing.overflow > tolerancePx) {
-    failures.push(`Sidebar: content overflowed by ${sidebarSupportSpacing.overflow.toFixed(2)}px`);
+    failures.push('Sidebar: navigation, Settings, or the window-bar Ko-fi badge was not found');
+  } else {
+    if (sidebarSupportSpacing.listOverflow > tolerancePx) {
+      failures.push(`Sidebar: navigation list scrolls by ${sidebarSupportSpacing.listOverflow.toFixed(2)}px with Controller expanded`);
+    }
+    if (sidebarSupportSpacing.settingsGap < 16 - tolerancePx) {
+      failures.push(`Sidebar: Settings is ${sidebarSupportSpacing.settingsGap.toFixed(2)}px under the list, expected 16px`);
+    }
+    if (sidebarSupportSpacing.badgeClearance < 8 - tolerancePx) {
+      failures.push(`Window bar: Ko-fi badge has only ${sidebarSupportSpacing.badgeClearance.toFixed(2)}px of clearance`);
+    }
+    if (sidebarSupportSpacing.overflow > tolerancePx) {
+      failures.push(`Sidebar: content overflowed by ${sidebarSupportSpacing.overflow.toFixed(2)}px`);
+    }
   }
 
   const rows = [];
@@ -121,32 +99,31 @@ try {
   let targetTextLeft = null;
   let targetPresetTop = null;
 
-  await controlsNav.getByRole('tab', { name: 'Overview' }).click();
+  await openControlTab(page, 'Overview');
   await page.waitForTimeout(150);
 
+  // Quick Actions is the persona grid with the Sleep Controller row under it;
+  // the Quick Controls frame spans the same height beside it.
   const overviewControlAlignment = await page.evaluate(() => {
-    const actionButtons = [
-      ...(document.querySelectorAll('.overview-quick-actions .overview-action-grid button') ?? [])
-    ];
     const personaGrid = document.querySelector('.overview-quick-actions .overview-persona-grid');
+    const sleepRow = document.querySelector('.overview-quick-actions .overview-sleep-row');
     const sliderList = document.querySelector('.overview-sliders .overview-slider-list');
 
-    if (actionButtons.length < 2 || !personaGrid || !sliderList) {
+    if (!personaGrid || !sleepRow || !sliderList) {
       return null;
     }
 
-    const actionButtonRects = actionButtons.slice(0, 2).map((button) => button.getBoundingClientRect());
     const personaRect = personaGrid.getBoundingClientRect();
+    const sleepRect = sleepRow.getBoundingClientRect();
     const sliderRect = sliderList.getBoundingClientRect();
-    const actionTop = Math.min(...actionButtonRects.map((rect) => rect.top));
 
     return {
-      actionTop,
+      actionTop: personaRect.top,
       sliderTop: sliderRect.top,
-      personaBottom: personaRect.bottom,
+      personaBottom: sleepRect.bottom,
       sliderBottom: sliderRect.bottom,
-      topDelta: sliderRect.top - actionTop,
-      bottomDelta: sliderRect.bottom - personaRect.bottom,
+      topDelta: sliderRect.top - personaRect.top,
+      bottomDelta: sliderRect.bottom - sleepRect.bottom,
       sliderHeight: sliderRect.height
     };
   });
@@ -165,16 +142,16 @@ try {
     });
 
     if (Math.abs(overviewControlAlignment.topDelta) > tolerancePx) {
-      failures.push(`Overview: quick controls frame top differs from action buttons by ${overviewControlAlignment.topDelta.toFixed(2)}px`);
+      failures.push(`Overview: quick controls frame top differs from the persona grid by ${overviewControlAlignment.topDelta.toFixed(2)}px`);
     }
 
     if (Math.abs(overviewControlAlignment.bottomDelta) > tolerancePx) {
-      failures.push(`Overview: quick controls frame bottom differs from persona row by ${overviewControlAlignment.bottomDelta.toFixed(2)}px`);
+      failures.push(`Overview: quick controls frame bottom differs from the Sleep Controller row by ${overviewControlAlignment.bottomDelta.toFixed(2)}px`);
     }
   }
 
   for (const tab of tabs) {
-    await controlsNav.getByRole('tab', { name: tab }).click();
+    await openControlTab(page, tab);
     await page.waitForTimeout(150);
 
     const measurement = await page.evaluate(() => {
@@ -251,9 +228,7 @@ try {
     }
   }
 
-  await controlsNav.getByRole('tab', { name: 'Haptics' }).click();
-  await page.waitForTimeout(150);
-  await page.getByRole('switch', { name: 'Enter Audio Haptics' }).click();
+  await openControlTab(page, 'Audio Haptics');
   await page.waitForTimeout(150);
 
   const audioHapticsMeasurement = await page.evaluate(() => {
@@ -433,11 +408,8 @@ try {
     }
   }
 
-  await page.getByRole('switch', { name: 'Exit Audio Haptics' }).click();
-  await page.waitForTimeout(150);
-
   for (const tab of testButtonTabs) {
-    await controlsNav.getByRole('tab', { name: tab }).click();
+    await openControlTab(page, tab);
     await page.waitForTimeout(150);
 
     const measurements = await page.evaluate(() => {
@@ -556,7 +528,7 @@ try {
     }
   }
 
-  await controlsNav.getByRole('tab', { name: 'System' }).click();
+  await openControlTab(page, 'System');
   await page.waitForTimeout(150);
 
   const systemTypography = await page.evaluate(() => {
@@ -597,7 +569,43 @@ try {
     }
   }
 
+  await openControlTab(page, 'Settings');
+  await page.waitForTimeout(150);
+  const settingsRows = [];
+  for (const section of await page.locator('.settings-section-button').allTextContents()) {
+    await page.locator('.settings-section-button').filter({ hasText: section }).first().click();
+    await page.waitForTimeout(80);
+    const settingsLayout = await page.evaluate(() => {
+      const surface = document.querySelector('.settings-page.active .settings-page-surface');
+      const sidebar = document.querySelector('.settings-sidebar');
+      const rows = [...(surface?.querySelectorAll('.settings-category-section:not([hidden]) .settings-menu-row') ?? [])];
+      const clippedRows = rows.filter((row) => row.scrollWidth - row.clientWidth > 1).length;
+      return surface && sidebar ? {
+        horizontal: Math.max(0, surface.scrollWidth - surface.clientWidth),
+        sidebarOverflow: Math.max(0, sidebar.scrollHeight - sidebar.clientHeight),
+        rows: rows.length,
+        clippedRows
+      } : null;
+    });
+    if (!settingsLayout) {
+      failures.push(`Settings ${section}: page surface or sidebar was not found`);
+      continue;
+    }
+    settingsRows.push({ section, ...settingsLayout });
+    if (settingsLayout.horizontal > tolerancePx) {
+      failures.push(`Settings ${section}: page scrolls horizontally by ${settingsLayout.horizontal}px`);
+    }
+    if (settingsLayout.sidebarOverflow > tolerancePx) {
+      failures.push(`Settings ${section}: sidebar overflowed by ${settingsLayout.sidebarOverflow}px`);
+    }
+    if (settingsLayout.clippedRows > 0) {
+      failures.push(`Settings ${section}: ${settingsLayout.clippedRows} row(s) clip their content`);
+    }
+  }
+  await page.getByRole('button', { name: 'Back to app' }).click();
+
   console.table(rows);
+  console.table(settingsRows);
   console.table(audioHapticsRows);
   console.table(audioHapticsSelectorRows);
   console.table(audioHapticsConfigControlRows);
@@ -606,9 +614,10 @@ try {
   console.table(systemTypographyRows);
   console.table(overviewControlAlignmentRows);
   console.table(sidebarSupportSpacing ? [{
-    region: 'Ko-fi badge',
-    above: Number(sidebarSupportSpacing.above.toFixed(2)),
-    below: Number(sidebarSupportSpacing.below.toFixed(2)),
+    region: 'Sidebar',
+    listOverflow: Number(sidebarSupportSpacing.listOverflow.toFixed(2)),
+    settingsGap: Number(sidebarSupportSpacing.settingsGap.toFixed(2)),
+    badgeClearance: Number(sidebarSupportSpacing.badgeClearance.toFixed(2)),
     overflow: Number(sidebarSupportSpacing.overflow.toFixed(2))
   }] : []);
 
@@ -616,5 +625,5 @@ try {
     throw new Error(`Layout check failed:\n${failures.join('\n')}`);
   }
 } finally {
-  await app.close();
+  await close();
 }

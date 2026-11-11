@@ -5,18 +5,29 @@
 #include <cstring>
 
 #include "audio.h"
+#include "bootloader_authorization_flash.h"
+#include "bootloader_confirmation.h"
+#include "bootloader_maintenance.h"
 #include "bt.h"
 #include "controller_output_policy.h"
 #include "controller_output_submit.h"
 #include "dualsense_output.h"
 #include "dualsense_battery_status.h"
 #include "firmware_log.h"
+#include "home_chord_gate.h"
 #include "host_input.h"
+#include "keyboard_tap_sequencer.h"
 #include "persona/host_persona.h"
 #include "radial_deadzone.h"
+#include "trigger_motor_power.h"
+#include "wake_on_lan.h"
+#include "wake_on_lan_domain.h"
+#include "watchdog_telemetry.h"
 #include "pico/critical_section.h"
 #include "pico/cyw43_arch.h"
 #include "pico/bootrom.h"
+#include "pico/rand.h"
+#include "pico/sha256.h"
 #include "pico/unique_id.h"
 #include "pico/time.h"
 #include "usb.h"
@@ -32,6 +43,8 @@ namespace {
 constexpr uint8_t kMagic[] = {'D', 'S', '5', 'B'};
 constexpr uint8_t kProtocolMajor = 1;
 constexpr uint8_t kProtocolMinor = 24;
+static_assert(kProtocolMinor == ds5::wake_on_lan::kProtocolMinor);
+static_assert(COMPANION_REPORT_WAKE_ON_LAN == ds5::wake_on_lan::kStatusReportId);
 constexpr uint8_t kProtocolMinSupportedMinor = 7;
 static_assert(DS5_FIRMWARE_VERSION_MAJOR <= 255);
 static_assert(DS5_FIRMWARE_VERSION_MINOR <= 255);
@@ -75,13 +88,12 @@ constexpr uint8_t kDpadLeft = 0x06;
 constexpr uint8_t kDpadUpLeft = 0x07;
 constexpr uint8_t kDpadNeutral = 0x08;
 constexpr uint32_t kShortcutRepeatUs = 180000;
-constexpr uint32_t kHomeChordSuppressUs = 250000;
-constexpr uint32_t kHomeChordFallbackReplayUs = 80000;
+// SET_LIGHTBAR_COLOR flags byte. Older apps send 0, which always applies.
+constexpr uint8_t kLightbarColorRefreshFlag = 0x01;
 constexpr uint8_t kDefaultMuteKeyboardUsage = 0x68; // F13
 constexpr uint8_t kMuteKeyboardModifierMask = 0x0F;
 constexpr uint8_t kMuteKeyboardChordStarterFlag = 0x10;
 constexpr uint8_t kMuteKeyboardHoldFlag = 0x80;
-constexpr uint32_t kKeyboardPressDurationUs = 40000;
 constexpr uint32_t kMuteKeyboardChordWindowUs = 250000;
 constexpr uint32_t kMuteLedFlashDurationUs = 120000;
 constexpr uint32_t kClassicRumbleTestDurationUs = 650000;
@@ -156,12 +168,16 @@ enum CommandId : uint8_t {
     CommandForgetControllerPairings = 0x28,
     CommandForgetControllerPairing = 0x2E,
     CommandSetSpeakerGain = 0x32,
-    CommandEnterBootloader = 0x33,
+    // 0x33 and 0x50-0x55 are bootloader maintenance commands, handled by
+    // ds5::bootloader_maintenance before this switch.
     CommandSetWakeOnConnect = 0x35,
     CommandSetLightbarRestoreEnabled = 0x36,
     CommandSetRadialDeadzones = 0x37,
     CommandSetEdgeProfileSwitchingBlocked = 0x45,
     CommandSetAudioPacketMode = 0x46,
+    // Wake-on-LAN: the opcode is in value, its arguments in the payload. It
+    // is queued here and run from the main loop (companion_wake_command_poll).
+    CommandWakeOnLan = 0x57,
 };
 
 enum AckResult : uint8_t {
@@ -174,6 +190,7 @@ enum AckResult : uint8_t {
     AckNotConnected = 0x06,
     AckBusy = 0x07,
     AckPersistenceFailed = 0x08,
+    AckUnauthorized = 0x09,
 };
 
 enum MuteButtonMode : uint8_t {
@@ -349,16 +366,14 @@ uint8_t left_stick_radial_deadzone_percent = 0;
 uint8_t right_stick_radial_deadzone_percent = 0;
 bool shortcut_binding_last_pressed[kShortcutBindingCount]{};
 uint32_t shortcut_binding_last_step_us[kShortcutBindingCount]{};
-bool home_chord_gate_active = false;
-uint32_t home_chord_gate_until_us = 0;
-uint32_t home_chord_replay_until_us = 0;
+ds5::home_chord_gate::State home_chord_gate{};
 uint8_t shortcut_event_queue[kShortcutEventQueueDepth]{};
 uint8_t shortcut_event_head = 0;
 uint8_t shortcut_event_tail = 0;
 uint8_t shortcut_event_count = 0;
-bool mute_keyboard_pending = false;
-bool mute_keyboard_pressed = false;
-uint32_t mute_keyboard_release_at_us = 0;
+// Types the mute-button shortcut the way a person does, one stage per USB
+// report: modifiers, then the key, then modifiers, then nothing.
+ds5::KeyboardTapSequencer mute_keyboard_taps;
 bool mute_keyboard_chord_pending = false;
 uint32_t mute_keyboard_chord_until_us = 0;
 bool mute_led_flash_pending = false;
@@ -392,6 +407,10 @@ uint8_t companion_mic_volume_percent = 100;
 bool companion_mic_muted = false;
 bool companion_mic_enabled = false;
 uint8_t button_remap[RemapButtonCount]{};
+// One queued Wake-on-LAN command. It may carry the Wi-Fi password and is
+// erased as soon as the engine has consumed it.
+uint8_t pending_wake_command[COMPANION_PAYLOAD_SIZE]{};
+bool wake_command_pending = false;
 
 struct LastAck {
     uint8_t command_id = 0;
@@ -728,7 +747,9 @@ void feedback_trace_uart_loop() {
 #endif
 
 uint32_t uptime_seconds() {
-    return to_ms_since_boot(get_absolute_time()) / 1000;
+    // 64-bit microseconds: 32-bit milliseconds wrap after 49.7 days, which the
+    // companion would read as a bridge restart.
+    return static_cast<uint32_t>(time_us_64() / 1'000'000u);
 }
 
 void reset_button_remap() {
@@ -791,6 +812,14 @@ void set_lightbar_color(uint8_t red, uint8_t green, uint8_t blue, uint8_t bright
         bt_set_lightbar_color(lightbar_red, lightbar_green, lightbar_blue, lightbar_brightness);
         bt_schedule_lightbar_restore(250);
     }
+}
+
+void save_lightbar_color(uint8_t red, uint8_t green, uint8_t blue, uint8_t brightness) {
+    lightbar_red = red;
+    lightbar_green = green;
+    lightbar_blue = blue;
+    lightbar_brightness = std::min<uint8_t>(brightness, 100);
+    bt_save_lightbar_color(lightbar_red, lightbar_green, lightbar_blue, lightbar_brightness);
 }
 
 void clear_shortcut_events() {
@@ -860,14 +889,11 @@ void restore_defaults() {
     right_stick_radial_deadzone_percent = 0;
     std::fill(shortcut_binding_last_pressed, shortcut_binding_last_pressed + kShortcutBindingCount, false);
     std::fill(shortcut_binding_last_step_us, shortcut_binding_last_step_us + kShortcutBindingCount, 0);
-    home_chord_gate_active = false;
-    home_chord_gate_until_us = 0;
-    home_chord_replay_until_us = 0;
+    home_chord_gate = {};
     clear_dynamic_chord_bindings();
     bt_set_edge_profile_switching_blocked(false);
     clear_shortcut_events();
-    mute_keyboard_pending = false;
-    mute_keyboard_pressed = false;
+    mute_keyboard_taps.cancel();
     mute_keyboard_chord_pending = false;
     mute_led_flash_pending = false;
     audio_set_quiet_mode(false);
@@ -988,8 +1014,8 @@ void set_mute_button_action(uint8_t mode, uint8_t usage, uint8_t modifiers) {
     mute_keyboard_usage = usage == 0 ? kDefaultMuteKeyboardUsage : usage;
     mute_keyboard_modifiers = modifiers;
     mute_button_last_pressed = false;
-    mute_keyboard_pending = false;
-    mute_keyboard_pressed = false;
+    // A changed shortcut must not keep a key of the old one held.
+    mute_keyboard_taps.cancel();
     mute_keyboard_chord_pending = false;
     mute_led_flash_pending = false;
 
@@ -1018,7 +1044,10 @@ void cancel_mute_keyboard_chord_window() {
 }
 
 void queue_mute_keyboard_press(bool hold) {
-    mute_keyboard_pending = true;
+    ds5::BootKeyboardOutputReport report{};
+    report.bytes[0] = mute_keyboard_modifiers & kMuteKeyboardModifierMask;
+    report.bytes[ds5::kBootKeyboardUsageOffset] = mute_keyboard_usage;
+    mute_keyboard_taps.enqueue(report, hold);
     if (!hold) {
         mute_led_flash_pending = true;
         mute_led_flash_until_us = time_us_32() + kMuteLedFlashDurationUs;
@@ -1027,12 +1056,11 @@ void queue_mute_keyboard_press(bool hold) {
 }
 
 void queue_mute_keyboard_release() {
-    if (!mute_keyboard_pending && !mute_keyboard_pressed) {
+    if (mute_keyboard_taps.idle()) {
         return;
     }
-    mute_keyboard_pending = false;
-    mute_keyboard_pressed = true;
-    mute_keyboard_release_at_us = time_us_32();
+    // A Hold press released before the PC saw it still arrives as a full tap.
+    mute_keyboard_taps.release();
     mute_led_flash_pending = false;
     refresh_mute_led_policy();
 }
@@ -1058,15 +1086,6 @@ void toggle_quiet_mode() {
     const bool enabled = !audio_quiet_mode_enabled();
     audio_set_quiet_mode(enabled);
     refresh_mute_led_policy();
-}
-
-uint8_t trigger_power_reduction(uint8_t intensity_percent) {
-    if (intensity_percent >= 100) {
-        return 0;
-    }
-    const uint8_t clamped = intensity_percent > 100 ? 100 : intensity_percent;
-    const uint8_t reduction = static_cast<uint8_t>(((100 - clamped) * 8 + 50) / 100);
-    return std::min<uint8_t>(reduction, 7);
 }
 
 void set_trigger_off(uint8_t *trigger) {
@@ -1163,6 +1182,14 @@ void cache_game_trigger_effects(uint8_t const *payload, uint16_t len) {
         return;
     }
 
+    // Latch the game's motor power byte whenever it is valid. Its low nibble
+    // (body rumble) and high nibble (trigger reduction) persist on the
+    // controller until the game sends the flag again.
+    if (len > kTriggerEffectPowerOffset && (payload[1] & kTriggerMotorPowerFlag) != 0) {
+        cached_game_trigger_motor_power = payload[kTriggerEffectPowerOffset];
+        cached_game_trigger_motor_power_valid = true;
+    }
+
     const uint8_t trigger_flags = payload[0] & kTriggerEffectFlags;
     if (trigger_flags == 0) {
         return;
@@ -1184,14 +1211,6 @@ void cache_game_trigger_effects(uint8_t const *payload, uint16_t len) {
         memcpy(cached_game_trigger_left, payload + kTriggerEffectLeftOffset, sizeof(cached_game_trigger_left));
         cached_game_trigger_left_valid = true;
     }
-
-    const bool has_motor_power = (
-        len > 1
-        && len > kTriggerEffectPowerOffset
-        && (payload[1] & kTriggerMotorPowerFlag) != 0
-    );
-    cached_game_trigger_motor_power = has_motor_power ? payload[kTriggerEffectPowerOffset] : 0;
-    cached_game_trigger_motor_power_valid = has_motor_power;
 }
 
 bool build_scaled_cached_game_trigger_effect(
@@ -1227,7 +1246,7 @@ bool build_scaled_cached_game_trigger_effect(
         if (left_valid && trigger_effect_block_active(left_trigger)) {
             set_trigger_off(left_trigger);
         }
-        motor_power = 0;
+        motor_power = ds5::trigger_power::with_trigger_motor_power(motor_power, 0);
         motor_power_valid = true;
         return true;
     }
@@ -1239,8 +1258,9 @@ bool build_scaled_cached_game_trigger_effect(
         if (left_valid && trigger_effect_block_active(left_trigger)) {
             scale_trigger_effect_block(left_trigger, trigger_effect_intensity_percent);
         }
-        motor_power = static_cast<uint8_t>(
-            (motor_power & 0xF0) | trigger_power_reduction(trigger_effect_intensity_percent)
+        motor_power = ds5::trigger_power::with_trigger_motor_power(
+            motor_power,
+            trigger_effect_intensity_percent
         );
         motor_power_valid = true;
         return true;
@@ -1473,11 +1493,25 @@ bool strip_persistent_trigger_effect_fields(uint8_t *payload, uint16_t len, uint
         payload[0] &= static_cast<uint8_t>(~kTriggerLeftEffectFlag);
         changed = true;
     }
-    if (len > 1 && (payload[1] & kTriggerMotorPowerFlag) != 0) {
-        payload[1] &= static_cast<uint8_t>(~kTriggerMotorPowerFlag);
+    // Keep the game's body-rumble reduction; only its trigger reduction must
+    // not weaken the bridge's persistent effect.
+    if (
+        len > kTriggerEffectPowerOffset
+        && (payload[1] & kTriggerMotorPowerFlag) != 0
+        && (payload[kTriggerEffectPowerOffset] & 0xf0) != 0
+    ) {
+        payload[kTriggerEffectPowerOffset] &= 0x0f;
         changed = true;
     }
     return changed;
+}
+
+// A persistent effect owns trigger strength, but the game's body-rumble
+// reduction (low nibble) must survive the periodic re-apply.
+uint8_t persistent_trigger_motor_power() {
+    return cached_game_trigger_motor_power_valid
+        ? static_cast<uint8_t>(cached_game_trigger_motor_power & 0x0f)
+        : 0;
 }
 
 void set_persistent_trigger_effect_state(
@@ -1518,7 +1552,8 @@ void apply_persistent_trigger_effect(bool force = false) {
         persistent_trigger_effect_left.start_percent,
         persistent_trigger_effect_left.wall_percent,
         persistent_trigger_effect_left.force_percent,
-        persistent_trigger_effect_left.active
+        persistent_trigger_effect_left.active,
+        persistent_trigger_motor_power()
     );
     // The custom report explicitly clears any side without a Lab override.
     // Immediately restore that side from the cached game output while leaving
@@ -1624,32 +1659,27 @@ void mute_keyboard_loop() {
         refresh_mute_led_policy();
     }
 
+    if (mute_keyboard_taps.idle()) {
+        return;
+    }
+    // The mute button lives on the controller; losing it must not leave a
+    // Hold key down on the PC.
+    if (!bt_is_controller_connected()) {
+        mute_keyboard_taps.cancel();
+    }
+
+    // The keyboard endpoint is ready again once the host has taken the last
+    // report, which is when the sequencer times each stage from. The bridge-only
+    // topology has no keyboard instance (0xff), and tud_hid_n_ready does not
+    // bounds-check its index.
     const uint8_t keyboard_hid_instance = host_persona_keyboard_hid_instance();
-    if (!tud_hid_n_ready(keyboard_hid_instance)) {
+    const bool ready = keyboard_hid_instance < CFG_TUD_HID && tud_hid_n_ready(keyboard_hid_instance);
+    ds5::BootKeyboardOutputReport report{};
+    if (!mute_keyboard_taps.next_report(now, ready, report) || !ready) {
         return;
     }
-
-    if (mute_keyboard_pending) {
-        uint8_t keyboard_report[8]{};
-        keyboard_report[0] = mute_keyboard_modifiers & kMuteKeyboardModifierMask;
-        keyboard_report[2] = mute_keyboard_usage;
-        if (tud_hid_n_report(keyboard_hid_instance, 0, keyboard_report, sizeof(keyboard_report))) {
-            mute_keyboard_pending = false;
-            mute_keyboard_pressed = true;
-            mute_keyboard_release_at_us = mute_keyboard_hold_enabled() ? 0 : now + kKeyboardPressDurationUs;
-        }
-        return;
-    }
-
-    if (
-        mute_keyboard_pressed
-        && mute_keyboard_release_at_us != 0
-        && static_cast<int32_t>(now - mute_keyboard_release_at_us) >= 0
-    ) {
-        uint8_t keyboard_report[8]{};
-        if (tud_hid_n_report(keyboard_hid_instance, 0, keyboard_report, sizeof(keyboard_report))) {
-            mute_keyboard_pressed = false;
-        }
+    if (tud_hid_n_report(keyboard_hid_instance, 0, report.bytes.data(), report.bytes.size())) {
+        mute_keyboard_taps.accept_report(now);
     }
 }
 
@@ -1795,6 +1825,30 @@ uint16_t build_device_identity(uint8_t *buffer, uint16_t reqlen) {
     pico_get_unique_board_id(&board_id);
     static_assert(PICO_UNIQUE_BOARD_ID_SIZE_BYTES == 8);
     memcpy(buffer + 55, board_id.id, PICO_UNIQUE_BOARD_ID_SIZE_BYTES);
+    return COMPANION_PAYLOAD_SIZE;
+}
+
+// Why the bridge last reset, captured at boot from the watchdog scratch
+// registers (watchdog_telemetry.h), so crashes can be read without a UART.
+uint16_t build_reset_evidence(uint8_t *buffer, uint16_t reqlen) {
+    if (reqlen < COMPANION_PAYLOAD_SIZE) {
+        return 0;
+    }
+
+    memset(buffer, 0, COMPANION_PAYLOAD_SIZE);
+    write_magic_and_version(buffer);
+    buffer[6] = 1; // Reset evidence schema version.
+    WatchdogTelemetrySnapshot snapshot{};
+    watchdog_telemetry_snapshot(&snapshot);
+    buffer[7] =
+        (snapshot.prior_watchdog_timeout ? 0x01 : 0x00)
+        | (snapshot.prior_snapshot_valid ? 0x02 : 0x00);
+    buffer[8] = snapshot.prior_phase;
+    buffer[9] = static_cast<uint8_t>(snapshot.prior_reason);
+    buffer[10] = snapshot.prior_abnormal_reset_count;
+    write_u32(buffer + 11, snapshot.prior_uptime_ms);
+    write_u32(buffer + 15, snapshot.prior_detail);
+    write_u32(buffer + 19, to_ms_since_boot(get_absolute_time()));
     return COMPANION_PAYLOAD_SIZE;
 }
 
@@ -2035,6 +2089,204 @@ uint16_t build_feedback_trace(uint8_t *buffer, uint16_t reqlen) {
 }
 #endif
 
+// Bootloader authorization (ported from Kitsune Input). The companion app
+// enrolls a secret once; each BOOTSEL entry then needs an HMAC over a fresh
+// challenge plus a random face-button sequence entered on the controller.
+ds5::bootloader_authorization::State bootloader_auth_state;
+ds5::bootloader_confirmation::State bootloader_confirmation_state;
+
+bool bootloader_port_controller_connected() {
+    return bt_is_controller_connected();
+}
+
+uint64_t bootloader_port_now_ms() {
+    return time_us_64() / 1000u;
+}
+
+bool bootloader_port_random_bytes(uint8_t *output, uint16_t size) {
+    if (output == nullptr) {
+        return false;
+    }
+    uint16_t offset = 0;
+    while (offset < size) {
+        rng_128_t random{};
+        get_rand_128(&random);
+        const uint16_t count = std::min<uint16_t>(static_cast<uint16_t>(sizeof(random.r)), static_cast<uint16_t>(size - offset));
+        memcpy(output + offset, random.r, count);
+        offset = static_cast<uint16_t>(offset + count);
+    }
+    return true;
+}
+
+bool bootloader_sha256(
+    uint8_t const *first,
+    size_t first_size,
+    uint8_t const *second,
+    size_t second_size,
+    uint8_t output[32]
+) {
+    pico_sha256_state_t state{};
+    if (pico_sha256_start_blocking(&state, SHA256_BIG_ENDIAN, false) != PICO_OK) {
+        return false;
+    }
+    pico_sha256_update_blocking(&state, first, first_size);
+    if (second_size > 0) {
+        pico_sha256_update_blocking(&state, second, second_size);
+    }
+    sha256_result_t result{};
+    pico_sha256_finish(&state, &result);
+    memcpy(output, result.bytes, sizeof(result.bytes));
+    return true;
+}
+
+bool bootloader_port_hmac_sha256(
+    uint8_t const key[ds5::bootloader_authorization::kSecretSize],
+    uint8_t const *message,
+    uint16_t message_size,
+    uint8_t output[ds5::bootloader_authorization::kTagSize]
+) {
+    if (key == nullptr || message == nullptr || output == nullptr) {
+        return false;
+    }
+    uint8_t inner_pad[64]{};
+    uint8_t outer_pad[64]{};
+    for (uint8_t index = 0; index < sizeof(inner_pad); ++index) {
+        const uint8_t key_byte = index < ds5::bootloader_authorization::kSecretSize ? key[index] : 0;
+        inner_pad[index] = static_cast<uint8_t>(key_byte ^ 0x36u);
+        outer_pad[index] = static_cast<uint8_t>(key_byte ^ 0x5cu);
+    }
+    uint8_t inner_hash[32]{};
+    return bootloader_sha256(inner_pad, sizeof(inner_pad), message, message_size, inner_hash)
+        && bootloader_sha256(outer_pad, sizeof(outer_pad), inner_hash, sizeof(inner_hash), output);
+}
+
+bool bootloader_port_read_unique_id(uint8_t output[8]) {
+    pico_unique_board_id_t board_id{};
+    pico_get_unique_board_id(&board_id);
+    memcpy(output, board_id.id, sizeof(board_id.id));
+    return true;
+}
+
+ds5::bootloader_maintenance::Context bootloader_maintenance_context() {
+    return {
+        .state = &bootloader_auth_state,
+        .ports = {
+            .controller_connected = bootloader_port_controller_connected,
+            .now_ms = bootloader_port_now_ms,
+            .random_bytes = bootloader_port_random_bytes,
+            .hmac_sha256 = bootloader_port_hmac_sha256,
+            .read_unique_id = bootloader_port_read_unique_id,
+            .load_record = bootloader_authorization_flash_load,
+            .store_record = bootloader_authorization_flash_store,
+            .erase_record = bootloader_authorization_flash_erase,
+        },
+    };
+}
+
+uint16_t build_bootloader_authorization(uint8_t *buffer, uint16_t reqlen) {
+    using ds5::bootloader_authorization::PhysicalConfirmationPurpose;
+    using ds5::bootloader_authorization::before_deadline;
+    if (reqlen < COMPANION_PAYLOAD_SIZE) {
+        return 0;
+    }
+
+    const auto &state = bootloader_auth_state;
+    const uint64_t now = bootloader_port_now_ms();
+    const bool challenge_active = state.challenge_active && before_deadline(now, state.challenge_expires_at_ms);
+    const bool enrollment_pending = state.enrollment_pending
+        && state.physical_confirmation_purpose == PhysicalConfirmationPurpose::Enrollment
+        && before_deadline(now, state.physical_confirmation_expires_at_ms);
+    const bool entry_confirmation = state.physical_confirmation_purpose == PhysicalConfirmationPurpose::BootloaderEntry
+        && before_deadline(now, state.physical_confirmation_expires_at_ms);
+    const bool confirmation_visible = enrollment_pending || entry_confirmation;
+
+    memset(buffer, 0, COMPANION_PAYLOAD_SIZE);
+    write_magic_and_version(buffer);
+    buffer[6] = ds5::bootloader_authorization::kReportSchemaVersion;
+    buffer[7] = static_cast<uint8_t>(
+        (state.authorized ? 0x01 : 0)
+        | (enrollment_pending ? 0x02 : 0)
+        | (enrollment_pending && state.physical_confirmation_confirmed ? 0x04 : 0)
+        | (challenge_active ? 0x08 : 0)
+        | (before_deadline(now, state.cooldown_expires_at_ms) ? 0x10 : 0)
+        | (entry_confirmation && !state.physical_confirmation_confirmed ? 0x20 : 0)
+        | (entry_confirmation && state.physical_confirmation_confirmed ? 0x40 : 0)
+    );
+    if (state.authorized) {
+        memcpy(buffer + 8, state.active.key_id, sizeof(state.active.key_id));
+    }
+    if (challenge_active) {
+        write_u32(buffer + 12, state.challenge_id);
+        memcpy(buffer + 16, state.nonce, sizeof(state.nonce));
+        write_u32(buffer + 32, static_cast<uint32_t>(state.challenge_expires_at_ms - now));
+    }
+    if (confirmation_visible) {
+        memcpy(buffer + 36, state.physical_confirmation_sequence, sizeof(state.physical_confirmation_sequence));
+        buffer[44] = state.physical_confirmation_progress;
+        buffer[45] = state.physical_confirmation_mistakes;
+        write_u32(buffer + 48, static_cast<uint32_t>(state.physical_confirmation_expires_at_ms - now));
+    }
+    return COMPANION_PAYLOAD_SIZE;
+}
+
+// Rare path: a confirmation is open, or a press from one still has to be
+// released. Every face-button press is consumed so it never reaches a game.
+void process_bootloader_confirmation_buttons(uint8_t *report) {
+    using namespace ds5::bootloader_confirmation;
+    using ds5::bootloader_authorization::PhysicalConfirmationPurpose;
+    auto &auth = bootloader_auth_state;
+    const auto context = bootloader_maintenance_context();
+    const bool pending = ds5::bootloader_maintenance::physical_confirmation_pending(context);
+    if (!pending && auth.physical_confirmation_purpose != PhysicalConfirmationPurpose::None
+        && !auth.physical_confirmation_confirmed) {
+        // The confirmation window expired while waiting for presses.
+        ds5::bootloader_maintenance::cancel_physical_confirmation(context);
+    }
+    const uint8_t expected_value = auth.physical_confirmation_progress < ds5::bootloader_authorization::kSequenceLength
+        ? auth.physical_confirmation_sequence[auth.physical_confirmation_progress]
+        : 0;
+    const FaceButton expected = valid_face_button(expected_value)
+        ? static_cast<FaceButton>(expected_value)
+        : FaceButton::Triangle;
+    const Result result = update(bootloader_confirmation_state, report[7], pending, expected);
+    if (result == Result::Idle) {
+        return;
+    }
+
+    report[7] &= static_cast<uint8_t>(~kFaceButtonMask);
+    if (result == Result::Correct) {
+        if (auth.physical_confirmation_progress < ds5::bootloader_authorization::kSequenceLength) {
+            ++auth.physical_confirmation_progress;
+        }
+        if (auth.physical_confirmation_progress == ds5::bootloader_authorization::kSequenceLength) {
+            (void)ds5::bootloader_maintenance::confirm_physical(context);
+            firmware_log_printf("[AUTH] controller face-button sequence confirmed\n");
+        }
+    } else if (result == Result::Incorrect) {
+        auth.physical_confirmation_progress = 0;
+        if (auth.physical_confirmation_mistakes < 0xff) {
+            ++auth.physical_confirmation_mistakes;
+        }
+        firmware_log_printf("[AUTH] controller face-button sequence restarted\n");
+    }
+}
+
+// Runs inline on every controller report from SRAM; idle costs three loads.
+__force_inline void filter_bootloader_confirmation_buttons(uint8_t *report) {
+    const bool confirmation_open =
+        bootloader_auth_state.physical_confirmation_purpose
+            != ds5::bootloader_authorization::PhysicalConfirmationPurpose::None
+        && !bootloader_auth_state.physical_confirmation_confirmed;
+    if (
+        !confirmation_open
+        && !bootloader_confirmation_state.active
+        && !bootloader_confirmation_state.waiting_for_release
+    ) {
+        return;
+    }
+    process_bootloader_confirmation_buttons(report);
+}
+
 void handle_command(uint8_t const *buffer, uint16_t bufsize) {
     uint8_t command_id = 0;
     uint8_t sequence = 0;
@@ -2060,6 +2312,39 @@ void handle_command(uint8_t const *buffer, uint16_t bufsize) {
 
     const uint16_t value = read_u16(buffer + 8);
     const uint8_t protocol_minor = buffer[5];
+    if (command_id == CommandWakeOnLan) {
+        if (protocol_minor < ds5::wake_on_lan::kProtocolMinor) {
+            set_ack(command_id, sequence, AckBadVersion);
+        } else if (wake_command_pending) {
+            set_ack(command_id, sequence, AckBusy);
+        } else {
+            memcpy(pending_wake_command, buffer, sizeof(pending_wake_command));
+            wake_command_pending = true;
+        }
+        return;
+    }
+    // Wi-Fi owns the radio; everything else waits until it is released.
+    if (wake_on_lan_quiet_gate()) {
+        set_ack(command_id, sequence, AckBusy);
+        return;
+    }
+    if (ds5::bootloader_maintenance::is_maintenance_command(command_id)) {
+        const auto result = ds5::bootloader_maintenance::execute(
+            bootloader_maintenance_context(),
+            {
+                .command_id = command_id,
+                .value = value,
+                .payload = buffer + 10,
+                .payload_size = static_cast<uint16_t>(COMPANION_PAYLOAD_SIZE - 10),
+            }
+        );
+        set_ack(command_id, sequence, static_cast<AckResult>(result.ack));
+        if (result.enter_bootloader_after_ack) {
+            firmware_log_printf("[Companion] Authorized reboot to BOOTSEL\n");
+            reset_usb_boot(0, 0);
+        }
+        return;
+    }
     switch (command_id) {
         case CommandSetHapticsGain:
             if (value > kMaxFeedbackGainPercent) {
@@ -2137,7 +2422,17 @@ void handle_command(uint8_t const *buffer, uint16_t bufsize) {
                 set_ack(command_id, sequence, AckNotConnected);
                 return;
             }
-            set_lightbar_color(buffer[10], buffer[11], buffer[12], static_cast<uint8_t>(value));
+            if (
+                (buffer[13] & kLightbarColorRefreshFlag) != 0
+                && !lightbar_override_enabled
+                && bt_host_lightbar_owned()
+            ) {
+                // A routine settings refresh while a game shows its own
+                // color only saves ours for the next restore.
+                save_lightbar_color(buffer[10], buffer[11], buffer[12], static_cast<uint8_t>(value));
+            } else {
+                set_lightbar_color(buffer[10], buffer[11], buffer[12], static_cast<uint8_t>(value));
+            }
             settings_revision++;
             set_ack(command_id, sequence, AckOk);
             return;
@@ -2485,6 +2780,11 @@ void handle_command(uint8_t const *buffer, uint16_t bufsize) {
             {
                 const HostPersonaMode next_persona = static_cast<HostPersonaMode>(value);
                 const bool changed = host_persona_active() != next_persona;
+                firmware_log_printf("[PERSONA] %u -> %u (changed=%d) at %lu ms\n",
+                                    static_cast<unsigned>(host_persona_active()),
+                                    static_cast<unsigned>(next_persona),
+                                    changed ? 1 : 0,
+                                    static_cast<unsigned long>(time_us_32() / 1000));
                 if (changed) {
                     host_input_prepare_persona_switch();
                 }
@@ -2616,6 +2916,9 @@ void handle_command(uint8_t const *buffer, uint16_t bufsize) {
                 return;
             }
             companion_mic_enabled = value == 1;
+            // Release LED passthrough before the forced mute below so
+            // disabling an unmuted mic never reports a lit mute LED.
+            audio_set_mic_mute_led_passthrough(mic_mute_led_passthrough_enabled());
             audio_set_duplex_requested(companion_mic_enabled);
             if (!companion_mic_enabled) {
                 set_companion_mic_muted(true);
@@ -2634,15 +2937,6 @@ void handle_command(uint8_t const *buffer, uint16_t bufsize) {
             restore_defaults();
             settings_revision++;
             set_ack(command_id, sequence, AckOk);
-            return;
-
-        case CommandEnterBootloader:
-            if (value != 0) {
-                set_ack(command_id, sequence, AckInvalidValue);
-                return;
-            }
-            set_ack(command_id, sequence, AckOk);
-            reset_usb_boot(0, 0);
             return;
 
         default:
@@ -2696,10 +2990,6 @@ void suppress_shortcut_input(const ShortcutBinding &binding, uint8_t *report) {
     }
 }
 
-bool time_us_reached(uint32_t now, uint32_t target) {
-    return static_cast<int32_t>(now - target) >= 0;
-}
-
 bool process_shortcut_bindings(uint8_t *report) {
     const uint32_t now = time_us_32();
     bool consumed = false;
@@ -2737,54 +3027,22 @@ bool home_chord_gate_enabled() {
     return false;
 }
 
-void clear_home_chord_gate() {
-    home_chord_gate_active = false;
-    home_chord_gate_until_us = 0;
-    home_chord_replay_until_us = 0;
-}
-
 void apply_home_chord_gate(uint8_t *report, uint16_t len, bool physical_home_pressed, bool home_chord_consumed) {
     if (report == nullptr || len <= 9) {
         return;
     }
 
-    if (home_chord_consumed) {
-        clear_home_chord_gate();
-        report[9] &= static_cast<uint8_t>(~kHomeButtonBit);
-        return;
-    }
-
-    if (!home_chord_gate_enabled()) {
-        clear_home_chord_gate();
-        return;
-    }
-
-    const uint32_t now = time_us_32();
-    if (physical_home_pressed) {
-        home_chord_replay_until_us = 0;
-        if (!home_chord_gate_active) {
-            home_chord_gate_active = true;
-            home_chord_gate_until_us = now + kHomeChordSuppressUs;
-        }
-        if (!time_us_reached(now, home_chord_gate_until_us)) {
-            report[9] &= static_cast<uint8_t>(~kHomeButtonBit);
-            return;
-        }
-        home_chord_gate_active = false;
-        home_chord_gate_until_us = 0;
-        return;
-    }
-
-    if (home_chord_gate_active) {
-        home_chord_gate_active = false;
-        home_chord_gate_until_us = 0;
-        home_chord_replay_until_us = now + kHomeChordFallbackReplayUs;
-    }
-
-    if (home_chord_replay_until_us != 0 && !time_us_reached(now, home_chord_replay_until_us)) {
+    const bool host_home_pressed = ds5::home_chord_gate::step(
+        home_chord_gate,
+        home_chord_gate_enabled(),
+        physical_home_pressed,
+        home_chord_consumed,
+        time_us_32()
+    );
+    if (host_home_pressed) {
         report[9] |= kHomeButtonBit;
     } else {
-        home_chord_replay_until_us = 0;
+        report[9] &= static_cast<uint8_t>(~kHomeButtonBit);
     }
 }
 
@@ -3118,6 +3376,7 @@ void apply_button_remap(uint8_t *report, uint16_t len) {
 
 void companion_init() {
     critical_section_init(&companion_report_cs);
+    ds5::bootloader_maintenance::initialize(bootloader_maintenance_context());
     restore_defaults();
     set_ack(0, 0, AckOk);
 #if DS5_FEEDBACK_TRACE_ENABLED && DS5_DEBUG_LOGS_ENABLED
@@ -3133,10 +3392,45 @@ void companion_init() {
 #endif
 }
 
+void companion_wake_command_poll() {
+    if (!wake_command_pending) {
+        return;
+    }
+    const uint8_t sequence = pending_wake_command[7];
+    const auto result = static_cast<AckResult>(wake_on_lan_command(
+        read_u16(pending_wake_command + 8),
+        pending_wake_command + 10,
+        COMPANION_PAYLOAD_SIZE - 10
+    ));
+    volatile uint8_t *secret = pending_wake_command;
+    for (size_t i = 0; i < sizeof(pending_wake_command); ++i) {
+        secret[i] = 0;
+    }
+    wake_command_pending = false;
+    set_ack(CommandWakeOnLan, sequence, result);
+}
+
 void companion_loop() {
+    if (wake_on_lan_quiet_gate()) {
+        return;
+    }
 #if DS5_FEEDBACK_TRACE_ENABLED && DS5_DEBUG_LOGS_ENABLED
     feedback_trace_uart_loop();
 #endif
+    // A game's trigger effects belong to that controller session; a later
+    // intensity change must not replay them onto a reconnected controller.
+    static bool controller_was_connected = false;
+    const bool controller_connected = bt_is_controller_connected();
+    if (controller_was_connected && !controller_connected) {
+        clear_cached_game_trigger_effects();
+        // A bootloader confirmation belongs to the controller that entered it.
+        ds5::bootloader_maintenance::cancel_physical_confirmation(bootloader_maintenance_context());
+        bootloader_confirmation_state = {};
+        // A PS press cut off by the disconnect must not replay, or skip the
+        // chord window, on the next controller session.
+        home_chord_gate = {};
+    }
+    controller_was_connected = controller_connected;
     audio_test_haptics_loop();
     classic_rumble_test_loop();
     mute_keyboard_chord_window_loop();
@@ -3155,6 +3449,9 @@ void companion_process_controller_report(uint8_t *report, uint16_t len) {
     have_raw_stick_sample = true;
     raw_stick_sequence++;
     critical_section_exit(&companion_report_cs);
+
+    // Before chords and remapping, so sequence presses trigger nothing else.
+    filter_bootloader_confirmation_buttons(report);
 
     const bool home_pressed = (report[9] & kHomeButtonBit) != 0;
     const uint8_t dpad_direction = report[7] & kDpadMask;
@@ -3175,7 +3472,12 @@ void companion_process_controller_report(uint8_t *report, uint16_t len) {
         report[9] &= static_cast<uint8_t>(~kHomeButtonBit);
     }
 
-    report[9] &= static_cast<uint8_t>(~kMuteButtonBit);
+    // In Normal mode the PC sees the mute button too, as with a wired
+    // controller (Steam Input, DS4Windows, Discord). Every other mode gives
+    // the button a bridge-side job, so the host never sees it.
+    if (mute_button_mode != MuteButtonNormal) {
+        report[9] &= static_cast<uint8_t>(~kMuteButtonBit);
+    }
 
     if (mute_pressed && !mute_button_last_pressed) {
         if (mute_button_mode == MuteButtonNormal) {
@@ -3403,8 +3705,14 @@ bool companion_apply_trigger_effect_intensity(uint8_t *payload, uint16_t len) {
 
     if (len > kTriggerEffectPowerOffset) {
         const uint8_t next_flags = payload[1] | kTriggerMotorPowerFlag;
-        const uint8_t next_power = static_cast<uint8_t>(
-            (payload[kTriggerEffectPowerOffset] & 0xF0) | trigger_power_reduction(trigger_effect_intensity_percent)
+        // Compose with the game's latched motor power rather than this
+        // report's byte, which is stale when the report omits the flag.
+        const uint8_t game_power = cached_game_trigger_motor_power_valid
+            ? cached_game_trigger_motor_power
+            : 0;
+        const uint8_t next_power = ds5::trigger_power::with_trigger_motor_power(
+            game_power,
+            trigger_effect_intensity_percent
         );
         changed = changed || payload[1] != next_flags || payload[kTriggerEffectPowerOffset] != next_power;
         payload[1] = next_flags;
@@ -3423,11 +3731,23 @@ uint16_t companion_get_report(uint8_t report_id, hid_report_type_t report_type, 
     }
 
     switch (report_id) {
+        case COMPANION_REPORT_WAKE_ON_LAN: {
+            if (buffer == nullptr || reqlen < COMPANION_PAYLOAD_SIZE) {
+                return 0;
+            }
+            uint8_t report[64]{};
+            wake_on_lan_encode_status(report, sizeof(report));
+            memcpy(buffer, report + 1, COMPANION_PAYLOAD_SIZE);
+            return COMPANION_PAYLOAD_SIZE;
+        }
         case COMPANION_REPORT_STATUS:
             return build_status(buffer, reqlen);
         case COMPANION_REPORT_ACK:
             return build_ack(buffer, reqlen);
         case COMPANION_REPORT_INPUT:
+            if (wake_on_lan_quiet_gate()) {
+                return 0;
+            }
             return build_input_report(buffer, reqlen);
 #if DS5_AUDIO_DEBUG_ENABLED
         case COMPANION_REPORT_AUDIO_DEBUG:
@@ -3441,6 +3761,10 @@ uint16_t companion_get_report(uint8_t report_id, hid_report_type_t report_type, 
             return build_device_identity(buffer, reqlen);
         case COMPANION_REPORT_FIRMWARE_LOG:
             return build_firmware_log(buffer, reqlen);
+        case COMPANION_REPORT_BOOTLOADER_AUTHORIZATION:
+            return build_bootloader_authorization(buffer, reqlen);
+        case COMPANION_REPORT_RESET_EVIDENCE:
+            return build_reset_evidence(buffer, reqlen);
 #if DS5_TRIGGER_TRACE_ENABLED
         case COMPANION_REPORT_TRIGGER_TRACE:
             return build_trigger_trace(buffer, reqlen);
